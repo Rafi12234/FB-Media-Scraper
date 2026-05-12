@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>FB Media Scraper</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>FB Media Scraper</h1>
+      <p class="status" id="status">Idle</p>
+
+      <div class="counts">
+        <div><span id="imageCount">0</span> images</div>
+        <div><span id="videoCount">0</span> videos</div>
+      </div>
+
+      <div class="options">
+        <label>
+          Max scrolls
+          <input type="number" id="maxScrolls" min="1" step="1" />
+        </label>
+        <label>
+          Idle rounds
+          <input type="number" id="idleLimit" min="1" step="1" />
+        </label>
+        <label>
+          Delay (ms)
+          <input type="number" id="delayMs" min="200" step="100" />
+        </label>
+      </div>
+
+      <div class="toggles">
+        <label><input type="checkbox" id="includeImages" /> Include images</label>
+        <label><input type="checkbox" id="includeVideos" /> Include videos</label>
+        <label><input type="checkbox" id="excludeThumbs" /> Exclude video thumbnails</label>
+        <label><input type="checkbox" id="excludeSmall" /> Exclude tiny UI images</label>
+      </div>
+
+      <div class="buttons">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn">Stop</button>
+        <button id="resetBtn">Reset</button>
+      </div>
+
+      <div class="export">
+        <button id="downloadJson">Download JSON</button>
+        <button id="downloadTxt">Download TXT</button>
+        <button id="copyJson">Copy JSON</button>
+      </div>
+
+      <div class="export">
+        <button id="downloadMedia">Download Media Files</button>
+      </div>
+
+      <p class="hint">Open a Facebook page tab before starting.</p>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

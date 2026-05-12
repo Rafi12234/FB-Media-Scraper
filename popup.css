@@ -1,0 +1,107 @@
+:root {
+  --bg: #0c0f14;
+  --panel: #121824;
+  --accent: #3fb950;
+  --text: #f5f7fb;
+  --muted: #9aa4b2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 12px;
+  width: 320px;
+  background: radial-gradient(circle at top, #1c2534, #0c0f14 60%);
+  color: var(--text);
+  font: 13px/1.4 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.wrap {
+  background: var(--panel);
+  border: 1px solid #1f2a3a;
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.4);
+}
+
+h1 {
+  margin: 0 0 6px;
+  font-size: 16px;
+  letter-spacing: 0.2px;
+}
+
+.status {
+  margin: 0 0 10px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.counts {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  color: var(--muted);
+}
+
+.options {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.options label,
+.toggles label {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
+input[type="number"] {
+  width: 90px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid #2a3950;
+  background: #0c121a;
+  color: var(--text);
+}
+
+.toggles {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.buttons,
+.export {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+button {
+  border: 1px solid #243347;
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: #101826;
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #3d4f68;
+}
+
+#startBtn {
+  background: linear-gradient(135deg, #2d6b3a, #3fb950);
+  border-color: #3fb950;
+}
+
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
