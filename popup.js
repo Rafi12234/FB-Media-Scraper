@@ -11,6 +11,9 @@ const defaultOptions = {
 const statusEl = document.getElementById("status");
 const imageCountEl = document.getElementById("imageCount");
 const videoCountEl = document.getElementById("videoCount");
+const batchSectionEl = document.getElementById("batchSection");
+const batchListEl = document.getElementById("batchList");
+const batchButtons = new Map();
 
 const fields = {
   maxScrolls: document.getElementById("maxScrolls"),
@@ -29,6 +32,54 @@ function setStatus(text) {
 function updateCounts(images, videos) {
   imageCountEl.textContent = String(images || 0);
   videoCountEl.textContent = String(videos || 0);
+}
+
+function showBatchSection() {
+  if (batchSectionEl.hasAttribute("hidden")) {
+    batchSectionEl.removeAttribute("hidden");
+  }
+}
+
+function clearBatchSection() {
+  batchButtons.clear();
+  batchListEl.textContent = "";
+  batchSectionEl.setAttribute("hidden", "hidden");
+}
+
+function addBatchButton(message) {
+  const sessionId = message.sessionId || "";
+  const batchIndex = Number(message.batchIndex) || 0;
+  const batchTotal = Number(message.batchTotal) || 0;
+  if (!sessionId || !batchIndex) return;
+
+  const key = `${sessionId}:${batchIndex}`;
+  if (batchButtons.has(key)) return;
+
+  const resolvedCount = Number(message.resolvedCount) || 0;
+  if (resolvedCount <= 0) return;
+  const label = batchTotal > 0 ? `Batch ${batchIndex}/${batchTotal}` : `Batch ${batchIndex}`;
+  const button = document.createElement("button");
+  button.className = "batch-button";
+  button.textContent = `Download ${label} (${resolvedCount} images)`;
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    button.textContent = `Downloading ${label}...`;
+    chrome.runtime.sendMessage(
+      { type: "DOWNLOAD_IMAGE_BATCH", sessionId, batchIndex },
+      (response) => {
+        const err = chrome.runtime.lastError;
+        if (err || !response || !response.ok) {
+          button.disabled = false;
+          button.textContent = `Download ${label} (${resolvedCount} images)`;
+          setStatus(response && response.message ? response.message : "Batch download failed");
+        }
+      }
+    );
+  });
+
+  batchButtons.set(key, button);
+  showBatchSection();
+  batchListEl.appendChild(button);
 }
 
 function readOptions() {
@@ -126,6 +177,7 @@ document.getElementById("startBtn").addEventListener("click", async () => {
   saveOptions(options);
   try {
     await sendToActiveTab({ type: "START", options });
+    clearBatchSection();
     setStatus("Running");
   } catch (err) {
     setStatus("Open a Facebook page tab");
@@ -145,6 +197,7 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
   try {
     await sendToActiveTab({ type: "RESET" });
     updateCounts(0, 0);
+    clearBatchSection();
     setStatus("Idle");
   } catch (err) {
     setStatus("Open a Facebook page tab");
@@ -204,6 +257,7 @@ document.getElementById("downloadMedia").addEventListener("click", async () => {
     const timestamp = formatTimestamp(new Date());
     const payload = {
       pageUrl: data.pageUrl || "",
+      pageTitle: data.pageTitle || "",
       timestamp,
       options,
       images: options.includeImages ? data.images : [],
@@ -230,16 +284,54 @@ document.getElementById("downloadMedia").addEventListener("click", async () => {
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "SCRAPE_PROGRESS") {
     updateCounts(message.images, message.videos);
-    setStatus(message.running ? "Running" : "Idle");
+    if (message.resolvingImages) {
+      setStatus("Resolving images...");
+    } else if (message.running && (message.imageCandidates || 0) > 0) {
+      setStatus(`Collecting links ${message.imageCandidates}`);
+    } else {
+      setStatus(message.running ? "Running" : "Idle");
+    }
+  }
+
+  if (message.type === "IMAGE_RESOLVE_PROGRESS") {
+    const current = message.current || 0;
+    const total = message.total || 0;
+    const batchIndex = message.batchIndex || 0;
+    const batchTotal = message.batchTotal || 0;
+    const batchCurrent = message.batchCurrent || 0;
+    const batchSize = message.batchSize || 0;
+    if (total > 0 && batchTotal > 0) {
+      setStatus(`Resolving images batch ${batchIndex}/${batchTotal} (${batchCurrent}/${batchSize})`);
+    } else if (total > 0) {
+      setStatus(`Resolving images ${current}/${total}`);
+    } else {
+      setStatus("Resolving images...");
+    }
+  }
+
+  if (message.type === "IMAGE_BATCH_READY") {
+    addBatchButton(message);
   }
 
   if (message.type === "DOWNLOAD_PROGRESS") {
     if (message.stage === "resolve") {
       setStatus(`Resolving videos ${message.current}/${message.total}`);
     } else if (message.stage === "download") {
-      setStatus(`Downloading media ${message.current}/${message.total}`);
+      const batchIndex = message.batchIndex || 0;
+      const batchTotal = message.batchTotal || 0;
+      const batchLabel = batchTotal > 1 ? ` (batch ${batchIndex}/${batchTotal})` : "";
+      const typeLabel = message.batchType === "videos" ? "videos" : "images";
+      setStatus(`Downloading ${typeLabel} ${message.current}/${message.total}${batchLabel}`);
     } else if (message.stage === "zip") {
-      setStatus(`Creating zip ${message.current}%`);
+      const batchIndex = message.batchIndex || 0;
+      const batchTotal = message.batchTotal || 0;
+      const batchLabel = batchTotal > 1 ? ` (batch ${batchIndex}/${batchTotal})` : "";
+      const typeLabel = message.batchType === "videos" ? "videos" : "images";
+      if ((message.total || 0) > 0) {
+        setStatus(`Creating ${typeLabel} zip file ${message.current}/${message.total}${batchLabel}`);
+      } else {
+        setStatus(`Creating ${typeLabel} zip...${batchLabel}`);
+      }
     }
   }
 
@@ -247,12 +339,28 @@ chrome.runtime.onMessage.addListener((message) => {
     const skipped = message.skippedVideos || 0;
     const invalid = message.invalidVideos || 0;
     const saved = message.saved || 0;
-    const zipName = message.zipName || "zip";
-    const suffix = `Saved ${saved} files to ${zipName}`;
+    const zipNames = Array.isArray(message.zipNames) ? message.zipNames : [];
+    const zipLabel = zipNames.length > 0 ? `${zipNames.length} zip file(s)` : (message.zipName || "zip");
+    const suffix = `Saved ${saved} files to ${zipLabel}`;
     if (skipped > 0 || invalid > 0) {
       setStatus(`Done (skipped ${skipped}, invalid ${invalid}). ${suffix}`);
     } else {
       setStatus(`Done. ${suffix}`);
+    }
+
+    if (message.batchType === "images") {
+      const sessionId = message.sessionId || "";
+      const batchIndex = message.batchIndex || 0;
+      const batchTotal = message.batchTotal || 0;
+      if (sessionId && batchIndex) {
+        const key = `${sessionId}:${batchIndex}`;
+        const button = batchButtons.get(key);
+        if (button) {
+          const label = batchTotal > 0 ? `Batch ${batchIndex}/${batchTotal}` : `Batch ${batchIndex}`;
+          button.textContent = `Downloaded ${label}`;
+          button.disabled = true;
+        }
+      }
     }
   }
 
@@ -265,7 +373,13 @@ loadOptions();
 sendToActiveTab({ type: "GET_STATUS" })
   .then((data) => {
     updateCounts(data.images, data.videos);
-    setStatus(data.running ? "Running" : "Idle");
+    if (data.resolvingImages) {
+      setStatus("Resolving images...");
+    } else if (data.running && (data.imageCandidates || 0) > 0) {
+      setStatus(`Collecting links ${data.imageCandidates}`);
+    } else {
+      setStatus(data.running ? "Running" : "Idle");
+    }
   })
   .catch(() => {
     setStatus("Open a Facebook page tab");
