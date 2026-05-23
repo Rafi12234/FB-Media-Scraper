@@ -82,6 +82,38 @@ input[type="number"] {
   margin-bottom: 8px;
 }
 
+.batch-section {
+  border-top: 1px solid #1f2a3a;
+  margin-top: 6px;
+  padding-top: 8px;
+}
+
+.batch-title {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.batch-list {
+  display: grid;
+  gap: 6px;
+}
+
+.batch-button {
+  border: 1px solid #2b3b52;
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: #0f1624;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.batch-button[disabled] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 button {
   border: 1px solid #243347;
   border-radius: 8px;
