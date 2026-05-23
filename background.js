@@ -1,12 +1,18 @@
 let downloadInProgress = false;
+let imageResolveInProgress = false;
+let imageResolveCancel = false;
+let batchDownloadInProgress = false;
+const imageResolveSessions = new Map();
 
 const VIDEO_FALLBACK_EXTENSION = ".mp4";
 const DOWNLOAD_DELAY_MS = 800;
 const TAB_LOAD_TIMEOUT_MS = 30000;
+const IMAGE_PAGE_DELAY_MS = 1200;
+const IMAGE_BATCH_SIZE = 400;
 const VIDEO_CONTENT_PREFIX = "video/";
 const DOWNLOADABLE_VIDEO_EXTENSIONS = [".mp4", ".m4v", ".webm", ".mov"];
 const ZIP_MIME = "application/zip";
-const MAX_ZIP_BYTES = 300 * 1024 * 1024;
+const MAX_ZIP_BYTES = 1024 * 1024 * 1024;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -89,12 +95,21 @@ function buildEndHeader(entries, centralSize, centralOffset) {
   return new Uint8Array(buffer);
 }
 
-async function buildZip(entries) {
+async function buildZip(entries, onProgress) {
   const encoder = new TextEncoder();
   const fileParts = [];
   const centralParts = [];
   const centralRecords = [];
   let offset = 0;
+  const totalFiles = entries.length;
+  let processedFiles = 0;
+
+  const reportProgress = () => {
+    if (typeof onProgress !== "function") return;
+    onProgress({ current: processedFiles, total: totalFiles });
+  };
+
+  reportProgress();
 
   for (const entry of entries) {
     const data = new Uint8Array(await entry.blob.arrayBuffer());
@@ -105,6 +120,8 @@ async function buildZip(entries) {
     fileParts.push(localHeader, nameBytes, data);
     centralRecords.push({ nameBytes, checksum, size: data.length, offset });
     offset += localHeader.length + nameBytes.length + data.length;
+    processedFiles += 1;
+    reportProgress();
   }
 
   let centralSize = 0;
@@ -115,11 +132,82 @@ async function buildZip(entries) {
   });
 
   const endHeader = buildEndHeader(centralRecords.length, centralSize, offset);
+  processedFiles = totalFiles;
+  reportProgress();
   return new Blob([...fileParts, ...centralParts, endHeader], { type: ZIP_MIME });
 }
 
 function sendProgress(message) {
   chrome.runtime.sendMessage(message);
+}
+
+async function createAndDownloadZip(entries, zipName, progressInfo) {
+  if (!entries.length) return { saved: 0, bytes: 0 };
+
+  const zipProgress = Object.assign({}, progressInfo || {});
+  sendProgress({ type: "DOWNLOAD_PROGRESS", stage: "zip", current: 0, total: entries.length, ...zipProgress });
+
+  let zipBlob;
+  try {
+    zipBlob = await buildZip(entries, (progress) => {
+      sendProgress({
+        type: "DOWNLOAD_PROGRESS",
+        stage: "zip",
+        current: progress.current || 0,
+        total: progress.total || entries.length,
+        ...zipProgress
+      });
+    });
+  } catch (err) {
+    sendProgress({
+      type: "DOWNLOAD_ERROR",
+      message: `Zip build failed: ${err && err.message ? err.message : "Unknown error"}`
+    });
+    return null;
+  }
+
+  sendProgress({ type: "DOWNLOAD_PROGRESS", stage: "zip", current: entries.length, total: entries.length, ...zipProgress });
+
+  if (zipBlob.size > MAX_ZIP_BYTES) {
+    sendProgress({
+      type: "DOWNLOAD_ERROR",
+      message: `Zip too large (${Math.round(zipBlob.size / (1024 * 1024))} MB). Reduce selection or disable zip mode.`
+    });
+    return null;
+  }
+
+  let zipUrl = "";
+  let revokeUrl = false;
+  try {
+    if (typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
+      zipUrl = URL.createObjectURL(zipBlob);
+      revokeUrl = true;
+    } else {
+      zipUrl = await blobToDataUrl(zipBlob);
+    }
+  } catch (err) {
+    sendProgress({
+      type: "DOWNLOAD_ERROR",
+      message: `Zip URL failed: ${err && err.message ? err.message : "Unknown error"}`
+    });
+    return null;
+  }
+
+  try {
+    await downloadFile(zipUrl, zipName);
+  } catch (err) {
+    sendProgress({
+      type: "DOWNLOAD_ERROR",
+      message: `Zip download failed: ${err && err.message ? err.message : "Unknown error"}`
+    });
+    return null;
+  } finally {
+    if (revokeUrl) {
+      setTimeout(() => URL.revokeObjectURL(zipUrl), 60000);
+    }
+  }
+
+  return { saved: entries.length, bytes: zipBlob.size };
 }
 
 function formatTimestamp(date) {
@@ -133,6 +221,30 @@ function formatTimestamp(date) {
     pad(date.getMinutes()) +
     pad(date.getSeconds())
   );
+}
+
+function sanitizeBaseName(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const ascii = raw.normalize("NFKD").replace(/[^\x20-\x7E]/g, "");
+  const cleaned = ascii.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!cleaned) return "";
+  return cleaned.slice(0, 60);
+}
+
+function chunkArray(items, size) {
+  const list = Array.isArray(items) ? items : [];
+  if (size <= 0) return [list];
+  const result = [];
+  for (let i = 0; i < list.length; i += size) {
+    result.push(list.slice(i, i + size));
+  }
+  return result;
+}
+
+function buildImageZipName(folder, batchIndex, batchTotal) {
+  if (batchTotal <= 1) return `${folder}.zip`;
+  return `${folder}_part${String(batchIndex).padStart(2, "0")}.zip`;
 }
 
 function getExtension(url, fallback) {
@@ -503,6 +615,262 @@ async function resolveVideoInTab(url) {
   return [];
 }
 
+async function extractBestImageFromTab(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const IMAGE_EXTENSIONS = [
+          ".jpg",
+          ".jpeg",
+          ".png",
+          ".gif",
+          ".webp",
+          ".bmp",
+          ".avif",
+          ".heic",
+          ".heif",
+          ".tif",
+          ".tiff",
+          ".jfif",
+          ".pjpeg",
+          ".pjp"
+        ];
+
+        const normalizeUrl = (raw) => {
+          if (!raw) return "";
+          const trimmed = String(raw).trim().replace(/^['"]|['"]$/g, "");
+          if (!trimmed) return "";
+          const lower = trimmed.toLowerCase();
+          if (lower.startsWith("data:") || lower.startsWith("blob:") || lower.startsWith("javascript:")) {
+            return "";
+          }
+          try {
+            return new URL(trimmed, window.location.href).toString();
+          } catch (err) {
+            return "";
+          }
+        };
+
+        const urlHasExtension = (url, extensions) => {
+          try {
+            const path = new URL(url).pathname.toLowerCase();
+            return extensions.some((ext) => path.endsWith(ext));
+          } catch (err) {
+            return false;
+          }
+        };
+
+        const isCandidateUrl = (url) => {
+          if (!url) return false;
+          const lower = url.toLowerCase();
+          if (!lower.includes("fbcdn.net") && !lower.includes("scontent.") && !lower.includes("fbsbx.com")) {
+            return false;
+          }
+          if (lower.includes("static.xx.fbcdn.net") || lower.includes("rsrc.php")) return false;
+          if (lower.includes("emoji")) return false;
+          if (!urlHasExtension(url, IMAGE_EXTENSIONS)) return false;
+          return true;
+        };
+
+        const pickLargestFromSrcset = (value) => {
+          if (!value) return "";
+          const entries = value.split(",");
+          let bestUrl = "";
+          let bestScore = 0;
+          entries.forEach((entry) => {
+            const parts = entry.trim().split(/\s+/);
+            const url = normalizeUrl(parts[0]);
+            if (!url) return;
+            const descriptor = parts[1] || "";
+            let score = 0;
+            if (descriptor.endsWith("w")) {
+              score = parseInt(descriptor, 10) || 0;
+            } else if (descriptor.endsWith("x")) {
+              score = Math.round((parseFloat(descriptor) || 0) * 1000);
+            }
+            if (score >= bestScore) {
+              bestScore = score;
+              bestUrl = url;
+            }
+          });
+          return bestUrl;
+        };
+
+        const ogImages = [];
+        [
+          'meta[property="og:image"]',
+          'meta[property="og:image:secure_url"]',
+          'meta[name="twitter:image"]',
+          'link[rel="image_src"]'
+        ].forEach((selector) => {
+          document.querySelectorAll(selector).forEach((node) => {
+            const raw = node.getAttribute("content") || node.getAttribute("href") || "";
+            const url = normalizeUrl(raw);
+            if (isCandidateUrl(url)) {
+              ogImages.push(url);
+            }
+          });
+        });
+
+        const candidates = new Set(ogImages);
+        let bestUrl = "";
+        let bestArea = 0;
+
+        document.querySelectorAll("img").forEach((img) => {
+          const direct = normalizeUrl(img.currentSrc || img.getAttribute("src"));
+          if (isCandidateUrl(direct)) {
+            const width = img.naturalWidth || img.width || 0;
+            const height = img.naturalHeight || img.height || 0;
+            const area = width * height;
+            if (area >= bestArea) {
+              bestArea = area;
+              bestUrl = direct;
+            }
+            candidates.add(direct);
+          }
+
+          const srcset = img.getAttribute("srcset") || "";
+          const largest = pickLargestFromSrcset(srcset);
+          if (isCandidateUrl(largest)) {
+            candidates.add(largest);
+          }
+        });
+
+        if (!bestUrl) {
+          bestUrl = ogImages[0] || Array.from(candidates)[0] || "";
+        }
+
+        return { bestUrl, candidates: Array.from(candidates), ogImages };
+      }
+    });
+
+    const entry = Array.isArray(results) ? results[0] : null;
+    return entry && entry.result ? entry.result : { bestUrl: "", candidates: [], ogImages: [] };
+  } catch (err) {
+    return { bestUrl: "", candidates: [], ogImages: [] };
+  }
+}
+
+async function resolveImageInTab(url) {
+  if (!url) return "";
+  const tab = await chrome.tabs.create({ url, active: false });
+  const tabId = tab.id;
+  if (!tabId) return "";
+
+  try {
+    await waitForTabComplete(tabId, TAB_LOAD_TIMEOUT_MS);
+    await sleep(IMAGE_PAGE_DELAY_MS);
+    let data = await extractBestImageFromTab(tabId);
+    if (!data.bestUrl) {
+      await sleep(IMAGE_PAGE_DELAY_MS);
+      data = await extractBestImageFromTab(tabId);
+    }
+    return data.bestUrl || "";
+  } finally {
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (err) {
+      // ignore
+    }
+  }
+}
+
+async function resolveImagesSequential(urls, context) {
+  const resolved = new Set();
+  let skipped = 0;
+  const list = Array.isArray(urls) ? urls : [];
+  const batchSize = IMAGE_BATCH_SIZE;
+  const batchTotal = batchSize > 0 ? Math.ceil(list.length / batchSize) : 0;
+  const tabId = context && context.tabId ? context.tabId : null;
+  const sessionId = context && context.sessionId ? context.sessionId : "";
+
+  let batchIndex = 1;
+  let batchProcessed = 0;
+  let batchResolved = [];
+
+  for (let index = 0; index < list.length; index += 1) {
+    if (imageResolveCancel) break;
+    batchProcessed += 1;
+    const batchSizeTotal = Math.min(batchSize, list.length - (batchIndex - 1) * batchSize);
+    sendProgress({
+      type: "IMAGE_RESOLVE_PROGRESS",
+      current: index + 1,
+      total: list.length,
+      batchIndex,
+      batchTotal,
+      batchCurrent: batchProcessed,
+      batchSize: batchSizeTotal
+    });
+
+    const bestUrl = await resolveImageInTab(list[index]);
+    if (bestUrl) {
+      resolved.add(bestUrl);
+      batchResolved.push(bestUrl);
+    } else {
+      skipped += 1;
+    }
+
+    const isBatchEnd = batchProcessed >= batchSize || index === list.length - 1;
+    if (isBatchEnd) {
+      const resolvedBatch = batchResolved.slice();
+      const candidateCount = batchProcessed;
+
+      let session = null;
+      if (sessionId) {
+        session = imageResolveSessions.get(sessionId);
+        if (session) {
+          session.batches.set(batchIndex, resolvedBatch);
+          session.batchCandidates.set(batchIndex, candidateCount);
+        }
+      }
+
+      if (tabId && resolvedBatch.length > 0) {
+        try {
+          await chrome.tabs.sendMessage(tabId, {
+            type: "IMAGE_RESOLVE_BATCH",
+            sessionId,
+            batchIndex,
+            batchTotal,
+            images: resolvedBatch
+          });
+        } catch (err) {
+          // ignore
+        }
+      }
+
+      sendProgress({
+        type: "IMAGE_BATCH_READY",
+        sessionId,
+        batchIndex,
+        batchTotal,
+        resolvedCount: resolvedBatch.length,
+        candidateCount,
+        pageTitle: session ? session.pageTitle : "",
+        imageBaseName: session ? session.imageBaseName : "",
+        timestamp: session ? session.timestamp : ""
+      });
+
+      batchIndex += 1;
+      batchProcessed = 0;
+      batchResolved = [];
+    }
+  }
+
+  sendProgress({
+    type: "IMAGE_RESOLVE_PROGRESS",
+    current: list.length,
+    total: list.length,
+    done: true,
+    batchIndex: batchTotal,
+    batchTotal,
+    batchCurrent: 0,
+    batchSize
+  });
+
+  return { images: Array.from(resolved), skipped };
+}
+
 async function downloadMedia(payload) {
   if (downloadInProgress) {
     sendProgress({ type: "DOWNLOAD_ERROR", message: "Download already running" });
@@ -517,6 +885,13 @@ async function downloadMedia(payload) {
 
     const images = Array.isArray(payload.images) ? payload.images : [];
     const videos = Array.isArray(payload.videos) ? payload.videos : [];
+    const pageTitle = sanitizeBaseName(payload.pageTitle || "");
+    const imageBaseName = pageTitle || "image";
+    const imageBatches = chunkArray(images, IMAGE_BATCH_SIZE);
+    const totalImageBatches = imageBatches.length;
+    const zipNames = [];
+    let totalSaved = 0;
+    let totalBytes = 0;
 
     let skippedVideos = 0;
     let invalidVideos = 0;
@@ -539,31 +914,54 @@ async function downloadMedia(payload) {
       }
     }
 
-    const totalItems = images.length + resolvedVideos.length;
-    const entries = [];
-    let totalBytes = 0;
-    let processed = 0;
-
     if (images.length > 0) {
       let imageIndex = 1;
-      for (const url of images) {
-        const ext = getExtension(url, ".jpg");
-        const entryName = `images/image_${String(imageIndex).padStart(4, "0")}${ext}`;
-        imageIndex += 1;
-        processed += 1;
-        try {
-          const blob = await fetchAsBlob(url);
-          totalBytes += blob.size;
-          entries.push({ name: entryName, blob });
-        } catch (err) {
-          invalidVideos += 1;
+      for (let batchIndex = 0; batchIndex < imageBatches.length; batchIndex += 1) {
+        const batchImages = imageBatches[batchIndex];
+        const entries = [];
+        let processed = 0;
+
+        for (const url of batchImages) {
+          const ext = getExtension(url, ".jpg");
+          const entryName = `images/${imageBaseName}_${imageIndex}${ext}`;
+          imageIndex += 1;
+          processed += 1;
+          try {
+            const blob = await fetchAsBlob(url);
+            totalBytes += blob.size;
+            entries.push({ name: entryName, blob });
+          } catch (err) {
+            invalidVideos += 1;
+          }
+          sendProgress({
+            type: "DOWNLOAD_PROGRESS",
+            stage: "download",
+            current: processed,
+            total: batchImages.length,
+            batchIndex: batchIndex + 1,
+            batchTotal: totalImageBatches,
+            batchType: "images"
+          });
+          await sleep(100);
         }
-        sendProgress({ type: "DOWNLOAD_PROGRESS", stage: "download", current: processed, total: totalItems });
-        await sleep(100);
+
+        const zipName = buildImageZipName(folder, batchIndex + 1, totalImageBatches);
+        const result = await createAndDownloadZip(entries, zipName, {
+          batchIndex: batchIndex + 1,
+          batchTotal: totalImageBatches,
+          batchType: "images"
+        });
+        if (result === null) {
+          return;
+        }
+        zipNames.push(zipName);
+        totalSaved += result.saved;
       }
     }
 
     if (resolvedVideos.length > 0) {
+      const entries = [];
+      let processed = 0;
       for (const item of resolvedVideos) {
         const ext = getExtension(item.url, VIDEO_FALLBACK_EXTENSION);
         const entryName = `videos/video_${String(item.index).padStart(4, "0")}${ext}`;
@@ -575,74 +973,49 @@ async function downloadMedia(payload) {
         } catch (err) {
           invalidVideos += 1;
         }
-        sendProgress({ type: "DOWNLOAD_PROGRESS", stage: "download", current: processed, total: totalItems });
+        sendProgress({
+          type: "DOWNLOAD_PROGRESS",
+          stage: "download",
+          current: processed,
+          total: resolvedVideos.length,
+          batchIndex: 1,
+          batchTotal: 1,
+          batchType: "videos"
+        });
         await sleep(DOWNLOAD_DELAY_MS);
       }
-    }
 
-    if (entries.length === 0) {
-      sendProgress({ type: "DOWNLOAD_DONE", skippedVideos, invalidVideos, zipName: `${folder}.zip`, saved: 0 });
-      return;
-    }
-
-    sendProgress({ type: "DOWNLOAD_PROGRESS", stage: "zip", current: 0, total: 100 });
-    let zipBlob;
-    try {
-      zipBlob = await buildZip(entries);
-    } catch (err) {
-      sendProgress({
-        type: "DOWNLOAD_ERROR",
-        message: `Zip build failed: ${err && err.message ? err.message : "Unknown error"}`
+      const zipName = `${folder}_videos.zip`;
+      const result = await createAndDownloadZip(entries, zipName, {
+        batchIndex: 1,
+        batchTotal: 1,
+        batchType: "videos"
       });
-      return;
-    }
-    sendProgress({ type: "DOWNLOAD_PROGRESS", stage: "zip", current: 100, total: 100 });
-
-    if (zipBlob.size > MAX_ZIP_BYTES) {
-      sendProgress({
-        type: "DOWNLOAD_ERROR",
-        message: `Zip too large (${Math.round(zipBlob.size / (1024 * 1024))} MB). Reduce selection or disable zip mode.`
-      });
-      return;
-    }
-
-    const zipName = `${folder}.zip`;
-    let zipUrl = "";
-    let revokeUrl = false;
-    try {
-      if (typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
-        zipUrl = URL.createObjectURL(zipBlob);
-        revokeUrl = true;
-      } else {
-        zipUrl = await blobToDataUrl(zipBlob);
+      if (result === null) {
+        return;
       }
-    } catch (err) {
-      sendProgress({
-        type: "DOWNLOAD_ERROR",
-        message: `Zip URL failed: ${err && err.message ? err.message : "Unknown error"}`
-      });
-      return;
+      zipNames.push(zipName);
+      totalSaved += result.saved;
     }
-    try {
-      await downloadFile(zipUrl, zipName);
-    } catch (err) {
+
+    if (zipNames.length === 0) {
       sendProgress({
-        type: "DOWNLOAD_ERROR",
-        message: `Zip download failed: ${err && err.message ? err.message : "Unknown error"}`
+        type: "DOWNLOAD_DONE",
+        skippedVideos,
+        invalidVideos,
+        zipName: `${folder}.zip`,
+        saved: 0
       });
       return;
-    } finally {
-      if (revokeUrl) {
-        setTimeout(() => URL.revokeObjectURL(zipUrl), 60000);
-      }
     }
 
     sendProgress({
       type: "DOWNLOAD_DONE",
       skippedVideos,
       invalidVideos,
-      zipName,
-      saved: entries.length,
+      zipName: zipNames[zipNames.length - 1],
+      zipNames,
+      saved: totalSaved,
       totalBytes
     });
   } catch (err) {
@@ -655,6 +1028,140 @@ async function downloadMedia(payload) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || !message.type) {
     return;
+  }
+
+  if (message.type === "RESOLVE_IMAGES") {
+    if (imageResolveInProgress) {
+      sendResponse({ ok: false, message: "Image resolve already running" });
+      return;
+    }
+
+    const sessionId = String(message.sessionId || `${Date.now()}_${Math.floor(Math.random() * 1000000)}`);
+    const pageTitle = sanitizeBaseName(message.pageTitle || "");
+    const imageBaseName = pageTitle || "image";
+    const timestamp = formatTimestamp(new Date());
+    const urls = Array.isArray(message.urls) ? message.urls : [];
+    const batchTotal = IMAGE_BATCH_SIZE > 0 ? Math.ceil(urls.length / IMAGE_BATCH_SIZE) : 0;
+
+    imageResolveSessions.clear();
+    imageResolveSessions.set(sessionId, {
+      sessionId,
+      pageTitle,
+      imageBaseName,
+      timestamp,
+      batchTotal,
+      batches: new Map(),
+      batchCandidates: new Map(),
+      downloadedBatches: new Set()
+    });
+
+    imageResolveInProgress = true;
+    imageResolveCancel = false;
+    resolveImagesSequential(urls, { sessionId, tabId: sender && sender.tab ? sender.tab.id : null })
+      .then((result) => {
+        imageResolveInProgress = false;
+        const canceled = imageResolveCancel;
+        imageResolveCancel = false;
+        sendResponse({ ok: true, images: result.images || [], skipped: result.skipped || 0, canceled });
+      })
+      .catch(() => {
+        imageResolveInProgress = false;
+        imageResolveCancel = false;
+        sendResponse({ ok: false, images: [], skipped: 0 });
+      });
+    return true;
+  }
+
+  if (message.type === "CANCEL_RESOLVE_IMAGES") {
+    imageResolveCancel = true;
+    sendResponse({ ok: true });
+    return;
+  }
+
+  if (message.type === "DOWNLOAD_IMAGE_BATCH") {
+    if (batchDownloadInProgress) {
+      sendResponse({ ok: false, message: "Batch download already running" });
+      return;
+    }
+
+    const sessionId = String(message.sessionId || "");
+    const batchIndex = Number(message.batchIndex) || 0;
+    const session = imageResolveSessions.get(sessionId);
+    if (!session || !batchIndex) {
+      sendResponse({ ok: false, message: "Batch not ready" });
+      return;
+    }
+
+    const batchImages = session.batches.get(batchIndex) || [];
+    if (batchImages.length === 0) {
+      sendResponse({ ok: false, message: "Batch is empty" });
+      return;
+    }
+
+    batchDownloadInProgress = true;
+    sendResponse({ ok: true });
+
+    (async () => {
+      const entries = [];
+      let processed = 0;
+      const imageBaseName = session.imageBaseName || "image";
+      const startIndex = (batchIndex - 1) * IMAGE_BATCH_SIZE + 1;
+      let imageIndex = startIndex;
+
+      for (const url of batchImages) {
+        const ext = getExtension(url, ".jpg");
+        const entryName = `images/${imageBaseName}_${imageIndex}${ext}`;
+        imageIndex += 1;
+        processed += 1;
+        try {
+          const blob = await fetchAsBlob(url);
+          entries.push({ name: entryName, blob });
+        } catch (err) {
+          // ignore failures for this batch
+        }
+        sendProgress({
+          type: "DOWNLOAD_PROGRESS",
+          stage: "download",
+          current: processed,
+          total: batchImages.length,
+          batchIndex,
+          batchTotal: session.batchTotal || 1,
+          batchType: "images"
+        });
+        await sleep(100);
+      }
+
+      const folder = `fb_media_${session.timestamp}`;
+      const zipName = buildImageZipName(folder, batchIndex, session.batchTotal || 1);
+      const result = await createAndDownloadZip(entries, zipName, {
+        batchIndex,
+        batchTotal: session.batchTotal || 1,
+        batchType: "images"
+      });
+      if (result === null) {
+        return;
+      }
+
+      session.downloadedBatches.add(batchIndex);
+      sendProgress({
+        type: "DOWNLOAD_DONE",
+        zipName,
+        zipNames: [zipName],
+        saved: result.saved,
+        sessionId,
+        batchIndex,
+        batchTotal: session.batchTotal || 1,
+        batchType: "images"
+      });
+    })()
+      .catch(() => {
+        sendProgress({ type: "DOWNLOAD_ERROR", message: "Batch download failed" });
+      })
+      .finally(() => {
+        batchDownloadInProgress = false;
+      });
+
+    return true;
   }
 
   if (message.type === "DOWNLOAD_MEDIA") {
