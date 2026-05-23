@@ -67,11 +67,15 @@ const SMALL_MARKERS = [
 
 const state = {
   running: false,
+  resolvingImages: false,
+  resolveRequestId: 0,
+  resolveSessionId: "",
   scrollCount: 0,
   idleCount: 0,
   lastHeight: 0,
   options: Object.assign({}, defaultOptions),
   images: new Set(),
+  imageCandidates: new Set(),
   videos: new Set(),
   videoResolved: new Map()
 };
@@ -129,6 +133,39 @@ function isLikelyImage(url) {
   return true;
 }
 
+function isFacebookImagePageUrl(url) {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (!host.endsWith("facebook.com")) return false;
+    const path = parsed.pathname.toLowerCase();
+    const params = parsed.searchParams;
+    if (path.includes("photo.php") || path.includes("/photo/") || path.includes("/photos/")) return true;
+    if (params.has("fbid") || params.has("photo_id")) return true;
+    if ((path.includes("/permalink.php") || path.includes("/story.php") || path.includes("/posts/")) &&
+      (params.has("story_fbid") || params.has("id"))) {
+      return true;
+    }
+    return false;
+  } catch (err) {
+    return false;
+  }
+}
+
+function isImageViewerPage() {
+  try {
+    const path = window.location.pathname.toLowerCase();
+    const params = new URLSearchParams(window.location.search);
+    if (path.includes("photo.php") || path.includes("/photo/") || path.includes("/photos/")) return true;
+    if (params.has("fbid") || params.has("photo_id")) return true;
+    if ((path.includes("/permalink.php") || path.includes("/story.php")) && params.has("story_fbid")) return true;
+    return false;
+  } catch (err) {
+    return false;
+  }
+}
+
 function isLikelyVideo(url) {
   if (!state.options.includeVideos) return false;
   const lower = url.toLowerCase();
@@ -150,6 +187,117 @@ function decodeEscapes(value) {
     .replace(/\\u003D/g, "=")
     .replace(/\\u002F/g, "/")
     .replace(/\\\//g, "/");
+}
+
+function cleanPageTitle(value) {
+  let text = String(value || "").trim();
+  if (!text) return "";
+  text = text.replace(/^\(\d+\)\s*/, "");
+  text = text.replace(/\s*[\-|•]\s*facebook.*$/i, "");
+  text = text.replace(/\s*\(\d+\)\s*$/i, "");
+  text = text.replace(/\s+messaged you.*$/i, "");
+  text = text.replace(/\s+sent you.*$/i, "");
+  text = text.replace(/\s+commented on.*$/i, "");
+  text = text.replace(/\s+reacted to.*$/i, "");
+  text = text.replace(/\s+liked.*$/i, "");
+  text = text.replace(/\s+shared.*$/i, "");
+  text = text.replace(/\s+posted.*$/i, "");
+  return text.trim();
+}
+
+function getPageNameFromUrl() {
+  try {
+    const parsed = new URL(window.location.href);
+    const params = parsed.searchParams;
+    const path = parsed.pathname || "/";
+    const segments = path.split("/").filter(Boolean).map((seg) => seg.trim()).filter(Boolean);
+    const reserved = new Set([
+      "photo.php",
+      "photos",
+      "photo",
+      "permalink.php",
+      "story.php",
+      "posts",
+      "reel",
+      "reels",
+      "videos",
+      "watch",
+      "watch.php",
+      "login",
+      "people",
+      "marketplace",
+      "events",
+      "saved",
+      "hashtag",
+      "groups",
+      "pages",
+      "profile.php",
+      "stories",
+      "notifications",
+      "messages",
+      "messaging"
+    ]);
+
+    if (segments[0] === "groups" && segments[1]) {
+      return `groups_${segments[1]}`;
+    }
+
+    if (segments[0] === "messages" && segments[1] === "t" && segments[2]) {
+      return segments[2];
+    }
+
+    if (segments[0] === "pages" && segments[1]) {
+      return segments[1];
+    }
+
+    if (segments[0] === "profile.php") {
+      const id = params.get("id");
+      if (id) return `profile_${id}`;
+    }
+
+    for (const segment of segments) {
+      if (reserved.has(segment.toLowerCase())) {
+        continue;
+      }
+      return segment;
+    }
+
+    const id = params.get("id") || params.get("story_fbid") || params.get("fbid");
+    if (id) return `fb_${id}`;
+  } catch (err) {
+    return "";
+  }
+  return "";
+}
+
+function getStablePageTitle() {
+  const fromUrl = getPageNameFromUrl();
+  if (fromUrl) {
+    return cleanPageTitle(fromUrl);
+  }
+
+  const ogTitle = document.querySelector('meta[property="og:title"]');
+  if (ogTitle && ogTitle.content) {
+    const cleaned = cleanPageTitle(ogTitle.content);
+    if (cleaned) return cleaned;
+  }
+
+  const metaTitle = document.querySelector('meta[name="title"], meta[property="title"]');
+  if (metaTitle && metaTitle.content) {
+    const cleaned = cleanPageTitle(metaTitle.content);
+    if (cleaned) return cleaned;
+  }
+
+  const h1 = document.querySelector("h1");
+  if (h1 && h1.textContent) {
+    const cleaned = cleanPageTitle(h1.textContent);
+    if (cleaned) return cleaned;
+  }
+
+  const cleanedTitle = cleanPageTitle(document.title || "");
+  if (cleanedTitle) return cleanedTitle;
+
+  return "";
 }
 
 function extractVideoUrlsFromText(text) {
@@ -263,6 +411,13 @@ function addImage(url) {
   }
 }
 
+function addImageCandidate(url) {
+  if (!url) return;
+  if (isFacebookImagePageUrl(url)) {
+    state.imageCandidates.add(url);
+  }
+}
+
 function addVideo(url) {
   if (!url) return;
   if (isLikelyVideo(url)) {
@@ -281,25 +436,40 @@ function collectFromSrcset(value) {
   });
 }
 
-function collectFromStyle(value) {
+function collectFromStyle(value, allowImages) {
   if (!value) return;
   const matches = value.match(/url\(([^)]+)\)/gi);
   if (!matches) return;
   matches.forEach((entry) => {
     const inner = entry.replace(/^url\(/i, "").replace(/\)$/i, "");
     const url = normalizeUrl(inner);
-    addImage(url);
+    if (allowImages) {
+      addImage(url);
+    }
     addVideo(url);
   });
 }
 
+function collectImageCandidateFromImg(img) {
+  if (!img || typeof img.closest !== "function") return;
+  const anchor = img.closest("a[href]");
+  if (!anchor) return;
+  const url = normalizeUrl(anchor.getAttribute("href"));
+  addImageCandidate(url);
+}
+
 function extractAll() {
+  const inImageViewer = isImageViewerPage();
+
   document.querySelectorAll("img").forEach((img) => {
-    ["src", "data-src", "data-lazy-src", "data-original", "data-url", "data-image"].forEach((attr) => {
-      addImage(normalizeUrl(img.getAttribute(attr)));
-    });
-    collectFromSrcset(img.getAttribute("srcset"));
-    collectFromSrcset(img.getAttribute("data-srcset"));
+    if (inImageViewer) {
+      ["src", "data-src", "data-lazy-src", "data-original", "data-url", "data-image"].forEach((attr) => {
+        addImage(normalizeUrl(img.getAttribute(attr)));
+      });
+      collectFromSrcset(img.getAttribute("srcset"));
+      collectFromSrcset(img.getAttribute("data-srcset"));
+    }
+    collectImageCandidateFromImg(img);
   });
 
   document.querySelectorAll("video, source").forEach((node) => {
@@ -316,7 +486,7 @@ function extractAll() {
   document.querySelectorAll("[style]").forEach((node) => {
     const style = node.getAttribute("style") || "";
     if (style.includes("url(")) {
-      collectFromStyle(style);
+      collectFromStyle(style, inImageViewer);
     }
   });
 }
@@ -325,9 +495,64 @@ function sendProgress() {
   chrome.runtime.sendMessage({
     type: "SCRAPE_PROGRESS",
     running: state.running,
+    resolvingImages: state.resolvingImages,
+    imageCandidates: state.imageCandidates.size,
     images: state.images.size,
     videos: state.videos.size
   });
+}
+
+function sendResolveImages(urls, requestId, sessionId, pageTitle, pageUrl) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { type: "RESOLVE_IMAGES", urls, requestId, sessionId, pageTitle, pageUrl },
+      (response) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        resolve({ images: [] });
+        return;
+      }
+      resolve(response || {});
+      }
+    );
+  });
+}
+
+function cancelResolveImages() {
+  state.resolveRequestId += 1;
+  state.resolveSessionId = "";
+  state.resolvingImages = false;
+  chrome.runtime.sendMessage({ type: "CANCEL_RESOLVE_IMAGES" }, () => {
+    // ignore
+  });
+}
+
+async function resolveFullSizeImages() {
+  if (!state.options.includeImages) return;
+  if (state.resolvingImages) return;
+  const candidates = Array.from(state.imageCandidates);
+  if (candidates.length === 0) return;
+
+  state.resolvingImages = true;
+  sendProgress();
+
+  const requestId = state.resolveRequestId + 1;
+  state.resolveRequestId = requestId;
+  const sessionId = `${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
+  state.resolveSessionId = sessionId;
+  const pageTitle = getStablePageTitle();
+  const pageUrl = window.location.href;
+
+  const response = await sendResolveImages(candidates, requestId, sessionId, pageTitle, pageUrl);
+  if (requestId !== state.resolveRequestId) {
+    return;
+  }
+
+  const resolved = Array.isArray(response.images) ? response.images : [];
+  resolved.forEach((url) => addImage(url));
+
+  state.resolvingImages = false;
+  sendProgress();
 }
 
 async function runScrape() {
@@ -366,6 +591,7 @@ async function runScrape() {
   state.running = false;
   extractAll();
   sendProgress();
+  resolveFullSizeImages();
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -373,6 +599,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "START") {
     state.options = Object.assign({}, defaultOptions, message.options || {});
+    cancelResolveImages();
     runScrape();
     sendResponse({ ok: true });
     return;
@@ -380,6 +607,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "STOP") {
     state.running = false;
+    cancelResolveImages();
     sendProgress();
     sendResponse({ ok: true });
     return;
@@ -387,8 +615,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "RESET") {
     state.images.clear();
+    state.imageCandidates.clear();
     state.videos.clear();
     state.running = false;
+    cancelResolveImages();
     sendProgress();
     sendResponse({ ok: true });
     return;
@@ -397,6 +627,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "GET_RESULTS") {
     sendResponse({
       pageUrl: window.location.href,
+      pageTitle: getStablePageTitle(),
       extractedAt: new Date().toISOString(),
       images: Array.from(state.images),
       videos: Array.from(state.videos)
@@ -422,9 +653,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "IMAGE_RESOLVE_BATCH") {
+    if (message.sessionId && message.sessionId !== state.resolveSessionId) {
+      return;
+    }
+    const batchImages = Array.isArray(message.images) ? message.images : [];
+    batchImages.forEach((url) => addImage(url));
+    sendProgress();
+    return;
+  }
+
   if (message.type === "GET_STATUS") {
     sendResponse({
       running: state.running,
+      resolvingImages: state.resolvingImages,
+      imageCandidates: state.imageCandidates.size,
       images: state.images.size,
       videos: state.videos.size
     });
