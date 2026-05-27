@@ -3,16 +3,58 @@ let imageResolveInProgress = false;
 let imageResolveCancel = false;
 let batchDownloadInProgress = false;
 const imageResolveSessions = new Map();
+const activeBatchDownloads = new Set();
+
+function saveSessions() {
+  const sessionsData = {};
+  imageResolveSessions.forEach((session, key) => {
+    sessionsData[key] = {
+      sessionId: session.sessionId,
+      pageTitle: session.pageTitle,
+      imageBaseName: session.imageBaseName,
+      timestamp: session.timestamp,
+      batchTotal: session.batchTotal,
+      batches: Array.from(session.batches.entries()),
+      batchCandidates: Array.from(session.batchCandidates.entries()),
+      downloadedBatches: Array.from(session.downloadedBatches)
+    };
+  });
+  chrome.storage.local.set({ imageResolveSessions: sessionsData });
+}
+
+function loadSessions() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['imageResolveSessions'], (result) => {
+      const sessionsData = result.imageResolveSessions || {};
+      Object.keys(sessionsData).forEach((key) => {
+        const data = sessionsData[key];
+        imageResolveSessions.set(key, {
+          sessionId: data.sessionId,
+          pageTitle: data.pageTitle,
+          imageBaseName: data.imageBaseName,
+          timestamp: data.timestamp,
+          batchTotal: data.batchTotal,
+          batches: new Map(data.batches || []),
+          batchCandidates: new Map(data.batchCandidates || []),
+          downloadedBatches: new Set(data.downloadedBatches || [])
+        });
+      });
+      resolve();
+    });
+  });
+}
+
+loadSessions();
 
 const VIDEO_FALLBACK_EXTENSION = ".mp4";
 const DOWNLOAD_DELAY_MS = 800;
 const TAB_LOAD_TIMEOUT_MS = 30000;
 const IMAGE_PAGE_DELAY_MS = 1200;
-const IMAGE_BATCH_SIZE = 400;
+const IMAGE_BATCH_SIZE = 300;
 const VIDEO_CONTENT_PREFIX = "video/";
 const DOWNLOADABLE_VIDEO_EXTENSIONS = [".mp4", ".m4v", ".webm", ".mov"];
 const ZIP_MIME = "application/zip";
-const MAX_ZIP_BYTES = 1024 * 1024 * 1024;
+const MAX_ZIP_BYTES = 500 * 1024 * 1024;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -839,6 +881,8 @@ async function resolveImagesSequential(urls, context) {
         }
       }
 
+      saveSessions();
+
       sendProgress({
         type: "IMAGE_BATCH_READY",
         sessionId,
@@ -1043,7 +1087,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const urls = Array.isArray(message.urls) ? message.urls : [];
     const batchTotal = IMAGE_BATCH_SIZE > 0 ? Math.ceil(urls.length / IMAGE_BATCH_SIZE) : 0;
 
-    imageResolveSessions.clear();
     imageResolveSessions.set(sessionId, {
       sessionId,
       pageTitle,
@@ -1079,14 +1122,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "DOWNLOAD_IMAGE_BATCH") {
-    if (batchDownloadInProgress) {
-      sendResponse({ ok: false, message: "Batch download already running" });
-      return;
-    }
-
     const sessionId = String(message.sessionId || "");
     const batchIndex = Number(message.batchIndex) || 0;
     const session = imageResolveSessions.get(sessionId);
+    
     if (!session || !batchIndex) {
       sendResponse({ ok: false, message: "Batch not ready" });
       return;
@@ -1097,8 +1136,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, message: "Batch is empty" });
       return;
     }
+    
+    const batchKey = `${sessionId}:${batchIndex}`;
+    if (activeBatchDownloads.has(batchKey)) {
+      sendResponse({ ok: false, message: "This batch is already downloading" });
+      return;
+    }
 
-    batchDownloadInProgress = true;
+    activeBatchDownloads.add(batchKey);
     sendResponse({ ok: true });
 
     (async () => {
@@ -1139,10 +1184,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         batchType: "images"
       });
       if (result === null) {
+        activeBatchDownloads.delete(batchKey);
         return;
       }
 
       session.downloadedBatches.add(batchIndex);
+      saveSessions();
+      
       sendProgress({
         type: "DOWNLOAD_DONE",
         zipName,
@@ -1158,7 +1206,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendProgress({ type: "DOWNLOAD_ERROR", message: "Batch download failed" });
       })
       .finally(() => {
-        batchDownloadInProgress = false;
+        activeBatchDownloads.delete(batchKey);
       });
 
     return true;
