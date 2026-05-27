@@ -46,6 +46,30 @@ function clearBatchSection() {
   batchSectionEl.setAttribute("hidden", "hidden");
 }
 
+function restoreBatchButtons() {
+  chrome.storage.local.get(['imageResolveSessions'], (result) => {
+    const sessionsData = result.imageResolveSessions || {};
+    Object.keys(sessionsData).forEach((key) => {
+      const session = sessionsData[key];
+      if (session.batches && Array.isArray(session.batches)) {
+        session.batches.forEach(([batchIndex, images]) => {
+          if (images && images.length > 0) {
+            const downloadedBatches = new Set(session.downloadedBatches || []);
+            if (!downloadedBatches.has(batchIndex)) {
+              addBatchButton({
+                sessionId: session.sessionId,
+                batchIndex,
+                batchTotal: session.batchTotal,
+                resolvedCount: images.length
+              });
+            }
+          }
+        });
+      }
+    });
+  });
+}
+
 function addBatchButton(message) {
   const sessionId = message.sessionId || "";
   const batchIndex = Number(message.batchIndex) || 0;
@@ -370,6 +394,7 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 loadOptions();
+restoreBatchButtons();
 sendToActiveTab({ type: "GET_STATUS" })
   .then((data) => {
     updateCounts(data.images, data.videos);
