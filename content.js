@@ -527,6 +527,30 @@ function cancelResolveImages() {
   });
 }
 
+
+
+function checkDeviceAccessFromContent() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "CHECK_DEVICE" }, (response) => {
+      const err = chrome.runtime.lastError;
+      resolve(Boolean(!err && response && response.allowed));
+    });
+  });
+}
+
+function sendUnauthorizedContentResponse(sendResponse) {
+  sendResponse({
+    ok: false,
+    allowed: false,
+    message: "Unauthorized device. This extension is locked to approved devices only.",
+    pageUrl: window.location.href,
+    pageTitle: getStablePageTitle(),
+    extractedAt: new Date().toISOString(),
+    images: [],
+    videos: []
+  });
+}
+
 async function resolveFullSizeImages() {
   if (!state.options.includeImages) return;
   if (state.resolvingImages) return;
@@ -594,15 +618,23 @@ async function runScrape() {
   resolveFullSizeImages();
 }
 
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || !message.type) return;
 
   if (message.type === "START") {
-    state.options = Object.assign({}, defaultOptions, message.options || {});
-    cancelResolveImages();
-    runScrape();
-    sendResponse({ ok: true });
-    return;
+    checkDeviceAccessFromContent().then((allowed) => {
+      if (!allowed) {
+        sendUnauthorizedContentResponse(sendResponse);
+        return;
+      }
+
+      state.options = Object.assign({}, defaultOptions, message.options || {});
+      cancelResolveImages();
+      runScrape();
+      sendResponse({ ok: true });
+    });
+    return true;
   }
 
   if (message.type === "STOP") {
@@ -625,14 +657,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "GET_RESULTS") {
-    sendResponse({
-      pageUrl: window.location.href,
-      pageTitle: getStablePageTitle(),
-      extractedAt: new Date().toISOString(),
-      images: Array.from(state.images),
-      videos: Array.from(state.videos)
+    checkDeviceAccessFromContent().then((allowed) => {
+      if (!allowed) {
+        sendUnauthorizedContentResponse(sendResponse);
+        return;
+      }
+
+      sendResponse({
+        ok: true,
+        pageUrl: window.location.href,
+        pageTitle: getStablePageTitle(),
+        extractedAt: new Date().toISOString(),
+        images: Array.from(state.images),
+        videos: Array.from(state.videos)
+      });
     });
-    return;
+    return true;
   }
 
   if (message.type === "PING") {
@@ -641,14 +681,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "EXTRACT_DIRECT_VIDEOS") {
-    const directVideos = extractDirectVideosFromDom();
-    sendResponse({ directVideos });
-    return;
+    checkDeviceAccessFromContent().then((allowed) => {
+      if (!allowed) {
+        sendResponse({ ok: false, allowed: false, directVideos: [], message: "Unauthorized device" });
+        return;
+      }
+      const directVideos = extractDirectVideosFromDom();
+      sendResponse({ ok: true, directVideos });
+    });
+    return true;
   }
 
   if (message.type === "RESOLVE_VIDEOS") {
-    resolveVideoLinks().then((result) => {
-      sendResponse(result);
+    checkDeviceAccessFromContent().then((allowed) => {
+      if (!allowed) {
+        sendResponse({ ok: false, allowed: false, directVideos: [], skipped: 0, message: "Unauthorized device" });
+        return;
+      }
+      resolveVideoLinks().then((result) => {
+        sendResponse(result);
+      });
     });
     return true;
   }
