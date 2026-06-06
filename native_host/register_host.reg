@@ -1,0 +1,4 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts\com.fb_media_scraper.device_check]
+@="C:\\REPLACE_WITH_YOUR_NATIVE_HOST_FOLDER\\com.fb_media_scraper.device_check.json"
