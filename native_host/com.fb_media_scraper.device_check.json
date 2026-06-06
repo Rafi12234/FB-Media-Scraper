@@ -1,0 +1,9 @@
+{
+    "name":  "com.fb_media_scraper.device_check",
+    "description":  "Device MAC checker for FB Media Scraper",
+    "path":  "D:\\Downloads\\FB_Media_Scraper_MAC_Locked\\fb_media_scraper_mac_locked\\native_host\\device_check_host.exe",
+    "type":  "stdio",
+    "allowed_origins":  [
+                            "chrome-extension://cdanogeefailapeheemfedjbhlikebfl/"
+                        ]
+}
