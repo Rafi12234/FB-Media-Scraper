@@ -85,7 +85,10 @@ function addBatchButton(message) {
   const button = document.createElement("button");
   button.className = "batch-button";
   button.textContent = `Download ${label} (${resolvedCount} images)`;
-  button.addEventListener("click", () => {
+  button.addEventListener("click", async () => {
+    const allowed = await checkDeviceBeforeUse();
+    if (!allowed) return;
+
     button.disabled = true;
     button.textContent = `Downloading ${label}...`;
     chrome.runtime.sendMessage(
@@ -196,11 +199,67 @@ function formatTimestamp(date) {
   );
 }
 
+let deviceAllowed = false;
+
+function setMainButtonsDisabled(disabled) {
+  [
+    "startBtn",
+    "stopBtn",
+    "resetBtn",
+    "downloadJson",
+    "downloadTxt",
+    "copyJson",
+    "downloadMedia"
+  ].forEach((id) => {
+    const button = document.getElementById(id);
+    if (button) {
+      button.disabled = disabled;
+    }
+  });
+}
+
+function disableMainButtons() {
+  setMainButtonsDisabled(true);
+}
+
+function enableMainButtons() {
+  setMainButtonsDisabled(false);
+}
+
+function checkDeviceBeforeUse() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "CHECK_DEVICE" }, (response) => {
+      const err = chrome.runtime.lastError;
+
+      if (err || !response || !response.allowed) {
+        deviceAllowed = false;
+        disableMainButtons();
+        const message = response && response.error ? response.error : "Unauthorized device";
+        setStatus(message);
+        resolve(false);
+        return;
+      }
+
+      deviceAllowed = true;
+      enableMainButtons();
+      setStatus("Device authorized");
+      resolve(true);
+    });
+  });
+}
+
 document.getElementById("startBtn").addEventListener("click", async () => {
+  const allowed = await checkDeviceBeforeUse();
+  if (!allowed) return;
+
   const options = readOptions();
   saveOptions(options);
   try {
-    await sendToActiveTab({ type: "START", options });
+    const response = await sendToActiveTab({ type: "START", options });
+    if (response && response.ok === false) {
+      setStatus(response.message || "Unauthorized device");
+      return;
+    }
     clearBatchSection();
     setStatus("Running");
   } catch (err) {
@@ -209,6 +268,9 @@ document.getElementById("startBtn").addEventListener("click", async () => {
 });
 
 document.getElementById("stopBtn").addEventListener("click", async () => {
+  const allowed = await checkDeviceBeforeUse();
+  if (!allowed) return;
+
   try {
     await sendToActiveTab({ type: "STOP" });
     setStatus("Stopped");
@@ -218,6 +280,9 @@ document.getElementById("stopBtn").addEventListener("click", async () => {
 });
 
 document.getElementById("resetBtn").addEventListener("click", async () => {
+  const allowed = await checkDeviceBeforeUse();
+  if (!allowed) return;
+
   try {
     await sendToActiveTab({ type: "RESET" });
     updateCounts(0, 0);
@@ -229,8 +294,15 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
 });
 
 document.getElementById("downloadJson").addEventListener("click", async () => {
+  const allowed = await checkDeviceBeforeUse();
+  if (!allowed) return;
+
   try {
     const data = await sendToActiveTab({ type: "GET_RESULTS" });
+    if (data && data.ok === false) {
+      setStatus(data.message || "Unauthorized device");
+      return;
+    }
     const timestamp = formatTimestamp(new Date());
     downloadFile(`facebook_media_${timestamp}.json`, JSON.stringify(data, null, 2), "application/json");
   } catch (err) {
@@ -239,22 +311,31 @@ document.getElementById("downloadJson").addEventListener("click", async () => {
 });
 
 document.getElementById("downloadTxt").addEventListener("click", async () => {
+  const allowed = await checkDeviceBeforeUse();
+  if (!allowed) return;
+
   try {
     const data = await sendToActiveTab({ type: "GET_RESULTS" });
+    if (data && data.ok === false) {
+      setStatus(data.message || "Unauthorized device");
+      return;
+    }
     const lines = [];
+    const images = Array.isArray(data.images) ? data.images : [];
+    const videos = Array.isArray(data.videos) ? data.videos : [];
     lines.push(`Source URL : ${data.pageUrl || ""}`);
-    lines.push(`Images     : ${data.images.length}`);
-    lines.push(`Videos     : ${data.videos.length}`);
+    lines.push(`Images     : ${images.length}`);
+    lines.push(`Videos     : ${videos.length}`);
     lines.push("");
     lines.push("IMAGES");
     lines.push("----------------------------------------");
-    data.images.forEach((item, index) => {
+    images.forEach((item, index) => {
       lines.push(`${index + 1}. ${item}`);
     });
     lines.push("");
     lines.push("VIDEOS");
     lines.push("----------------------------------------");
-    data.videos.forEach((item, index) => {
+    videos.forEach((item, index) => {
       lines.push(`${index + 1}. ${item}`);
     });
     const timestamp = formatTimestamp(new Date());
@@ -265,8 +346,15 @@ document.getElementById("downloadTxt").addEventListener("click", async () => {
 });
 
 document.getElementById("copyJson").addEventListener("click", async () => {
+  const allowed = await checkDeviceBeforeUse();
+  if (!allowed) return;
+
   try {
     const data = await sendToActiveTab({ type: "GET_RESULTS" });
+    if (data && data.ok === false) {
+      setStatus(data.message || "Unauthorized device");
+      return;
+    }
     await navigator.clipboard.writeText(JSON.stringify(data, null, 2));
     setStatus("Copied JSON to clipboard");
   } catch (err) {
@@ -275,17 +363,26 @@ document.getElementById("copyJson").addEventListener("click", async () => {
 });
 
 document.getElementById("downloadMedia").addEventListener("click", async () => {
+  const allowed = await checkDeviceBeforeUse();
+  if (!allowed) return;
+
   try {
     const data = await sendToActiveTab({ type: "GET_RESULTS" });
+    if (data && data.ok === false) {
+      setStatus(data.message || "Unauthorized device");
+      return;
+    }
     const options = readOptions();
     const timestamp = formatTimestamp(new Date());
+    const images = Array.isArray(data.images) ? data.images : [];
+    const videos = Array.isArray(data.videos) ? data.videos : [];
     const payload = {
       pageUrl: data.pageUrl || "",
       pageTitle: data.pageTitle || "",
       timestamp,
       options,
-      images: options.includeImages ? data.images : [],
-      videos: options.includeVideos ? data.videos : []
+      images: options.includeImages ? images : [],
+      videos: options.includeVideos ? videos : []
     };
 
     chrome.runtime.sendMessage({ type: "DOWNLOAD_MEDIA", payload }, (response) => {
@@ -393,19 +490,26 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
-loadOptions();
-restoreBatchButtons();
-sendToActiveTab({ type: "GET_STATUS" })
-  .then((data) => {
-    updateCounts(data.images, data.videos);
-    if (data.resolvingImages) {
-      setStatus("Resolving images...");
-    } else if (data.running && (data.imageCandidates || 0) > 0) {
-      setStatus(`Collecting links ${data.imageCandidates}`);
-    } else {
-      setStatus(data.running ? "Running" : "Idle");
-    }
-  })
-  .catch(() => {
-    setStatus("Open a Facebook page tab");
-  });
+disableMainButtons();
+
+checkDeviceBeforeUse().then((allowed) => {
+  if (!allowed) return;
+
+  loadOptions();
+  restoreBatchButtons();
+
+  sendToActiveTab({ type: "GET_STATUS" })
+    .then((data) => {
+      updateCounts(data.images, data.videos);
+      if (data.resolvingImages) {
+        setStatus("Resolving images...");
+      } else if (data.running && (data.imageCandidates || 0) > 0) {
+        setStatus(`Collecting links ${data.imageCandidates}`);
+      } else {
+        setStatus(data.running ? "Running" : "Idle");
+      }
+    })
+    .catch(() => {
+      setStatus("Open a Facebook page tab");
+    });
+});

@@ -3,7 +3,14 @@
   "name": "FB Media Scraper",
   "version": "1.0.0",
   "description": "Auto-scroll a Facebook page and extract image and video links.",
-  "permissions": ["activeTab", "downloads", "storage", "tabs", "scripting"],
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "storage",
+    "tabs",
+    "scripting",
+    "nativeMessaging"
+  ],
   "host_permissions": [
     "https://facebook.com/*",
     "https://*.facebook.com/*",
@@ -20,8 +27,14 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://facebook.com/*", "https://*.facebook.com/*", "https://fb.watch/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://facebook.com/*",
+        "https://*.facebook.com/*",
+        "https://fb.watch/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ]

@@ -5,6 +5,101 @@ let batchDownloadInProgress = false;
 const imageResolveSessions = new Map();
 const activeBatchDownloads = new Set();
 
+
+// =========================
+// Basic MAC Device Lock
+// =========================
+// This extension can only run on devices whose MAC address exists in this list.
+// Current allowed device MAC from your getmac output: D8-43-AE-14-32-81
+const DEVICE_HOST_NAME = "com.fb_media_scraper.device_check";
+const ALLOWED_MAC_ADDRESSES = [
+  "D8:43:AE:14:32:81"
+];
+const DEVICE_CHECK_CACHE_MS = 5 * 60 * 1000;
+
+let deviceAccessCache = {
+  checkedAt: 0,
+  allowed: false,
+  macs: [],
+  error: ""
+};
+
+function normalizeMacAddress(mac) {
+  return String(mac || "")
+    .trim()
+    .toUpperCase()
+    .replace(/-/g, ":");
+}
+
+function isAllowedDeviceMac(macs) {
+  const allowedSet = new Set(ALLOWED_MAC_ADDRESSES.map(normalizeMacAddress));
+  return (Array.isArray(macs) ? macs : []).some((mac) => allowedSet.has(normalizeMacAddress(mac)));
+}
+
+function checkDeviceAccess(force = false) {
+  return new Promise((resolve) => {
+    const now = Date.now();
+
+    if (
+      !force &&
+      deviceAccessCache.checkedAt &&
+      now - deviceAccessCache.checkedAt < DEVICE_CHECK_CACHE_MS
+    ) {
+      resolve(deviceAccessCache);
+      return;
+    }
+
+    if (!chrome.runtime || typeof chrome.runtime.sendNativeMessage !== "function") {
+      deviceAccessCache = {
+        checkedAt: Date.now(),
+        allowed: false,
+        macs: [],
+        error: "Native messaging is not available. Check manifest permission."
+      };
+      resolve(deviceAccessCache);
+      return;
+    }
+
+    chrome.runtime.sendNativeMessage(
+      DEVICE_HOST_NAME,
+      { type: "GET_MACS" },
+      (response) => {
+        const err = chrome.runtime.lastError;
+
+        if (err || !response || response.ok === false) {
+          deviceAccessCache = {
+            checkedAt: Date.now(),
+            allowed: false,
+            macs: [],
+            error: err ? err.message : response && response.error ? response.error : "Device check failed"
+          };
+          resolve(deviceAccessCache);
+          return;
+        }
+
+        const macs = Array.isArray(response.macs) ? response.macs : [];
+        const allowed = isAllowedDeviceMac(macs);
+
+        deviceAccessCache = {
+          checkedAt: Date.now(),
+          allowed,
+          macs,
+          error: allowed ? "" : "Unauthorized device"
+        };
+        resolve(deviceAccessCache);
+      }
+    );
+  });
+}
+
+function sendUnauthorizedResponse(sendResponse, error) {
+  sendResponse({
+    ok: false,
+    allowed: false,
+    message: error || "Unauthorized device. This extension is locked to approved devices only."
+  });
+}
+
 function saveSessions() {
   const sessionsData = {};
   imageResolveSessions.forEach((session, key) => {
@@ -1069,49 +1164,161 @@ async function downloadMedia(payload) {
   }
 }
 
+
+function handleResolveImagesMessage(message, sender, sendResponse) {
+  if (imageResolveInProgress) {
+    sendResponse({ ok: false, message: "Image resolve already running" });
+    return;
+  }
+
+  const sessionId = String(message.sessionId || `${Date.now()}_${Math.floor(Math.random() * 1000000)}`);
+  const pageTitle = sanitizeBaseName(message.pageTitle || "");
+  const imageBaseName = pageTitle || "image";
+  const timestamp = formatTimestamp(new Date());
+  const urls = Array.isArray(message.urls) ? message.urls : [];
+  const batchTotal = IMAGE_BATCH_SIZE > 0 ? Math.ceil(urls.length / IMAGE_BATCH_SIZE) : 0;
+
+  imageResolveSessions.set(sessionId, {
+    sessionId,
+    pageTitle,
+    imageBaseName,
+    timestamp,
+    batchTotal,
+    batches: new Map(),
+    batchCandidates: new Map(),
+    downloadedBatches: new Set()
+  });
+
+  imageResolveInProgress = true;
+  imageResolveCancel = false;
+  resolveImagesSequential(urls, { sessionId, tabId: sender && sender.tab ? sender.tab.id : null })
+    .then((result) => {
+      imageResolveInProgress = false;
+      const canceled = imageResolveCancel;
+      imageResolveCancel = false;
+      sendResponse({ ok: true, images: result.images || [], skipped: result.skipped || 0, canceled });
+    })
+    .catch(() => {
+      imageResolveInProgress = false;
+      imageResolveCancel = false;
+      sendResponse({ ok: false, images: [], skipped: 0 });
+    });
+}
+
+function handleDownloadImageBatchMessage(message, sendResponse) {
+  const sessionId = String(message.sessionId || "");
+  const batchIndex = Number(message.batchIndex) || 0;
+  const session = imageResolveSessions.get(sessionId);
+  
+  if (!session || !batchIndex) {
+    sendResponse({ ok: false, message: "Batch not ready" });
+    return;
+  }
+
+  const batchImages = session.batches.get(batchIndex) || [];
+  if (batchImages.length === 0) {
+    sendResponse({ ok: false, message: "Batch is empty" });
+    return;
+  }
+  
+  const batchKey = `${sessionId}:${batchIndex}`;
+  if (activeBatchDownloads.has(batchKey)) {
+    sendResponse({ ok: false, message: "This batch is already downloading" });
+    return;
+  }
+
+  activeBatchDownloads.add(batchKey);
+  sendResponse({ ok: true });
+
+  (async () => {
+    const entries = [];
+    let processed = 0;
+    const imageBaseName = session.imageBaseName || "image";
+    const startIndex = (batchIndex - 1) * IMAGE_BATCH_SIZE + 1;
+    let imageIndex = startIndex;
+
+    for (const url of batchImages) {
+      const ext = getExtension(url, ".jpg");
+      const entryName = `images/${imageBaseName}_${imageIndex}${ext}`;
+      imageIndex += 1;
+      processed += 1;
+      try {
+        const blob = await fetchAsBlob(url);
+        entries.push({ name: entryName, blob });
+      } catch (err) {
+        // ignore failures for this batch
+      }
+      sendProgress({
+        type: "DOWNLOAD_PROGRESS",
+        stage: "download",
+        current: processed,
+        total: batchImages.length,
+        batchIndex,
+        batchTotal: session.batchTotal || 1,
+        batchType: "images"
+      });
+      await sleep(100);
+    }
+
+    const folder = `fb_media_${session.timestamp}`;
+    const zipName = buildImageZipName(folder, batchIndex, session.batchTotal || 1);
+    const result = await createAndDownloadZip(entries, zipName, {
+      batchIndex,
+      batchTotal: session.batchTotal || 1,
+      batchType: "images"
+    });
+    if (result === null) {
+      activeBatchDownloads.delete(batchKey);
+      return;
+    }
+
+    session.downloadedBatches.add(batchIndex);
+    saveSessions();
+    
+    sendProgress({
+      type: "DOWNLOAD_DONE",
+      zipName,
+      zipNames: [zipName],
+      saved: result.saved,
+      sessionId,
+      batchIndex,
+      batchTotal: session.batchTotal || 1,
+      batchType: "images"
+    });
+  })()
+    .catch(() => {
+      sendProgress({ type: "DOWNLOAD_ERROR", message: "Batch download failed" });
+    })
+    .finally(() => {
+      activeBatchDownloads.delete(batchKey);
+    });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || !message.type) {
     return;
   }
 
-  if (message.type === "RESOLVE_IMAGES") {
-    if (imageResolveInProgress) {
-      sendResponse({ ok: false, message: "Image resolve already running" });
-      return;
-    }
-
-    const sessionId = String(message.sessionId || `${Date.now()}_${Math.floor(Math.random() * 1000000)}`);
-    const pageTitle = sanitizeBaseName(message.pageTitle || "");
-    const imageBaseName = pageTitle || "image";
-    const timestamp = formatTimestamp(new Date());
-    const urls = Array.isArray(message.urls) ? message.urls : [];
-    const batchTotal = IMAGE_BATCH_SIZE > 0 ? Math.ceil(urls.length / IMAGE_BATCH_SIZE) : 0;
-
-    imageResolveSessions.set(sessionId, {
-      sessionId,
-      pageTitle,
-      imageBaseName,
-      timestamp,
-      batchTotal,
-      batches: new Map(),
-      batchCandidates: new Map(),
-      downloadedBatches: new Set()
-    });
-
-    imageResolveInProgress = true;
-    imageResolveCancel = false;
-    resolveImagesSequential(urls, { sessionId, tabId: sender && sender.tab ? sender.tab.id : null })
-      .then((result) => {
-        imageResolveInProgress = false;
-        const canceled = imageResolveCancel;
-        imageResolveCancel = false;
-        sendResponse({ ok: true, images: result.images || [], skipped: result.skipped || 0, canceled });
-      })
-      .catch(() => {
-        imageResolveInProgress = false;
-        imageResolveCancel = false;
-        sendResponse({ ok: false, images: [], skipped: 0 });
+  if (message.type === "CHECK_DEVICE") {
+    checkDeviceAccess(true).then((device) => {
+      sendResponse({
+        ok: true,
+        allowed: device.allowed,
+        macs: device.macs,
+        error: device.error
       });
+    });
+    return true;
+  }
+
+  if (message.type === "RESOLVE_IMAGES") {
+    checkDeviceAccess().then((device) => {
+      if (!device.allowed) {
+        sendUnauthorizedResponse(sendResponse, device.error);
+        return;
+      }
+      handleResolveImagesMessage(message, sender, sendResponse);
+    });
     return true;
   }
 
@@ -1122,99 +1329,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "DOWNLOAD_IMAGE_BATCH") {
-    const sessionId = String(message.sessionId || "");
-    const batchIndex = Number(message.batchIndex) || 0;
-    const session = imageResolveSessions.get(sessionId);
-    
-    if (!session || !batchIndex) {
-      sendResponse({ ok: false, message: "Batch not ready" });
-      return;
-    }
-
-    const batchImages = session.batches.get(batchIndex) || [];
-    if (batchImages.length === 0) {
-      sendResponse({ ok: false, message: "Batch is empty" });
-      return;
-    }
-    
-    const batchKey = `${sessionId}:${batchIndex}`;
-    if (activeBatchDownloads.has(batchKey)) {
-      sendResponse({ ok: false, message: "This batch is already downloading" });
-      return;
-    }
-
-    activeBatchDownloads.add(batchKey);
-    sendResponse({ ok: true });
-
-    (async () => {
-      const entries = [];
-      let processed = 0;
-      const imageBaseName = session.imageBaseName || "image";
-      const startIndex = (batchIndex - 1) * IMAGE_BATCH_SIZE + 1;
-      let imageIndex = startIndex;
-
-      for (const url of batchImages) {
-        const ext = getExtension(url, ".jpg");
-        const entryName = `images/${imageBaseName}_${imageIndex}${ext}`;
-        imageIndex += 1;
-        processed += 1;
-        try {
-          const blob = await fetchAsBlob(url);
-          entries.push({ name: entryName, blob });
-        } catch (err) {
-          // ignore failures for this batch
-        }
-        sendProgress({
-          type: "DOWNLOAD_PROGRESS",
-          stage: "download",
-          current: processed,
-          total: batchImages.length,
-          batchIndex,
-          batchTotal: session.batchTotal || 1,
-          batchType: "images"
-        });
-        await sleep(100);
-      }
-
-      const folder = `fb_media_${session.timestamp}`;
-      const zipName = buildImageZipName(folder, batchIndex, session.batchTotal || 1);
-      const result = await createAndDownloadZip(entries, zipName, {
-        batchIndex,
-        batchTotal: session.batchTotal || 1,
-        batchType: "images"
-      });
-      if (result === null) {
-        activeBatchDownloads.delete(batchKey);
+    checkDeviceAccess().then((device) => {
+      if (!device.allowed) {
+        sendUnauthorizedResponse(sendResponse, device.error);
         return;
       }
-
-      session.downloadedBatches.add(batchIndex);
-      saveSessions();
-      
-      sendProgress({
-        type: "DOWNLOAD_DONE",
-        zipName,
-        zipNames: [zipName],
-        saved: result.saved,
-        sessionId,
-        batchIndex,
-        batchTotal: session.batchTotal || 1,
-        batchType: "images"
-      });
-    })()
-      .catch(() => {
-        sendProgress({ type: "DOWNLOAD_ERROR", message: "Batch download failed" });
-      })
-      .finally(() => {
-        activeBatchDownloads.delete(batchKey);
-      });
-
+      handleDownloadImageBatchMessage(message, sendResponse);
+    });
     return true;
   }
 
   if (message.type === "DOWNLOAD_MEDIA") {
-    downloadMedia(message.payload || {});
-    sendResponse({ ok: true });
+    checkDeviceAccess().then((device) => {
+      if (!device.allowed) {
+        sendUnauthorizedResponse(sendResponse, device.error);
+        return;
+      }
+      downloadMedia(message.payload || {});
+      sendResponse({ ok: true });
+    });
     return true;
   }
 });
