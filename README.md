@@ -9,7 +9,7 @@ Facebook-only media scraper extension. It auto-scrolls a Facebook page, collects
 - Timestamped folder layout inside the ZIP
 
 ## Supported Sites
-This extension only runs on Facebook domains:
+This extension only  runs on Facebook domains:
 - https://facebook.com/*
 - https://*.facebook.com/*
 - https://fb.watch/*
