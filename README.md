@@ -1,6 +1,6 @@
 # FB Media Scraper
 
-Facebook-only media scraper extension. It auto-scrolls a Facebook page, collects image and video links, then downloads everything as a single ZIP file.
+Facebook-only media scraper extension. It auto-scrolls a Facebook page, collects image and video links, then downloads everything as a single ZIP  file.
 
 ## Features
 - Auto-scroll scraping for images and videos
