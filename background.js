@@ -117,7 +117,7 @@ function saveSessions() {
       downloadedBatches: Array.from(session.downloadedBatches)
     };
   });
-  chrome.storage.local.set({ imageResolveSessions: sessionsData });
+  return chrome.storage.local.set({ imageResolveSessions: sessionsData });
 }
 
 function loadSessions() {
@@ -1004,7 +1004,7 @@ async function resolveImagesSequential(urls, context) {
         }
       }
 
-      saveSessions();
+      await saveSessions();
 
       sendProgress({
         type: "IMAGE_BATCH_READY",
@@ -1022,7 +1022,9 @@ async function resolveImagesSequential(urls, context) {
         // Serialized auto downloads; range selection already happened in content.js.
         const readyBatchIndex = batchIndex;
         autoDownloadQueue = autoDownloadQueue.then(async () => {
-          if (session.autoDownloadPaused) return;
+          if (session.autoDownloadPaused ||
+            session.downloadedBatches.has(readyBatchIndex) ||
+            activeBatchDownloads.has(session.sessionId + ":" + readyBatchIndex)) return;
           const outcome = await runImageBatch(session, readyBatchIndex);
           if (!outcome.ok) {
             session.autoDownloadPaused = true;
@@ -1108,7 +1110,7 @@ async function downloadMedia(payload) {
         downloadedBatches: new Set()
       };
       imageResolveSessions.set(sessionId, session);
-      saveSessions();
+      await saveSessions();
       for (let index = 1; index <= totalImageBatches; index += 1) {
         sendProgress({
           type: "IMAGE_BATCH_READY", sessionId, batchIndex: index,
