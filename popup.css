@@ -137,3 +137,8 @@ button:hover {
   color: var(--muted);
   font-size: 11px;
 }
+
+.range-note { color: var(--muted); font-size: 11px; margin: 0; }
+.batch-entry { border: 1px solid #27374c; border-radius: 8px; padding: 8px; display: grid; gap: 6px; }
+.batch-caption { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.batch-recover { border-color: #32864b; background: #173323; }
