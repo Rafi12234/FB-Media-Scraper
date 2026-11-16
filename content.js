@@ -4,6 +4,9 @@ const defaultOptions = {
   delayMs: 1200,
   includeImages: true,
   includeVideos: true,
+  autoDownloadImages: true,
+  imageFrom: 1,
+  imageTo: 0,
   excludeThumbs: true,
   excludeSmall: true
 };
@@ -505,7 +508,7 @@ function sendProgress() {
 function sendResolveImages(urls, requestId, sessionId, pageTitle, pageUrl) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(
-      { type: "RESOLVE_IMAGES", urls, requestId, sessionId, pageTitle, pageUrl },
+      { type: "RESOLVE_IMAGES", urls, requestId, sessionId, pageTitle, pageUrl, autoDownloadImages: state.options.autoDownloadImages },
       (response) => {
       const err = chrome.runtime.lastError;
       if (err) {
@@ -554,8 +557,16 @@ function sendUnauthorizedContentResponse(sendResponse) {
 async function resolveFullSizeImages() {
   if (!state.options.includeImages) return;
   if (state.resolvingImages) return;
-  const candidates = Array.from(state.imageCandidates);
-  if (candidates.length === 0) return;
+  // Collect ALL links first, then select the requested 1-based inclusive range.
+  const candidates = ImageRange.select(
+    Array.from(state.imageCandidates),
+    state.options.imageFrom,
+    state.options.imageTo
+  );
+  if (candidates.length === 0) {
+    sendProgress();
+    return;
+  }
 
   state.resolvingImages = true;
   sendProgress();
