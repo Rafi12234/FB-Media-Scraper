@@ -1,9 +1,12 @@
+importScripts("recovery.js", "batch_download.js");
+
 let downloadInProgress = false;
 let imageResolveInProgress = false;
 let imageResolveCancel = false;
 let batchDownloadInProgress = false;
 const imageResolveSessions = new Map();
 const activeBatchDownloads = new Set();
+let autoDownloadQueue = Promise.resolve();
 
 
 // =========================
@@ -139,7 +142,7 @@ function loadSessions() {
   });
 }
 
-loadSessions();
+const sessionsReady = loadSessions();
 
 const VIDEO_FALLBACK_EXTENSION = ".mp4";
 const DOWNLOAD_DELAY_MS = 800;
@@ -591,13 +594,35 @@ async function verifyVideoUrl(url) {
 
 function downloadFile(url, fileName) {
   return new Promise((resolve, reject) => {
-    chrome.downloads.download({ url, filename: fileName, saveAs: false }, (downloadId) => {
+    let downloadId = null;
+    let finished = false;
+    function finish(err) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      chrome.downloads.onChanged.removeListener(onChanged);
+      err ? reject(err) : resolve(downloadId);
+    }
+    function onChanged(delta) {
+      if (delta.id !== downloadId || !delta.state) return;
+      if (delta.state.current === "complete") finish();
+      if (delta.state.current === "interrupted") finish(new Error("ZIP download interrupted"));
+    }
+    const timeout = setTimeout(() => finish(new Error("ZIP download timed out; checkpoint retained")), 10 * 60 * 1000);
+    chrome.downloads.onChanged.addListener(onChanged);
+    chrome.downloads.download({ url, filename: fileName, saveAs: false }, (id) => {
       const err = chrome.runtime.lastError;
-      if (err || !downloadId) {
-        reject(new Error(err ? err.message : "Download failed"));
+      if (err || !id) {
+        finish(new Error(err ? err.message : "ZIP download failed"));
         return;
       }
-      resolve(downloadId);
+      downloadId = id;
+      // Small ZIPs can finish before the listener sees their completion event.
+      chrome.downloads.search({ id }, (items) => {
+        if (chrome.runtime.lastError || !items || !items.length) return;
+        if (items[0].state === "complete") finish();
+        if (items[0].state === "interrupted") finish(new Error("ZIP download interrupted"));
+      });
     });
   });
 }
@@ -940,10 +965,13 @@ async function resolveImagesSequential(urls, context) {
       batchSize: batchSizeTotal
     });
 
-    const bestUrl = await resolveImageInTab(list[index]);
-    if (bestUrl) {
+    const source = list[index];
+    const candidate = source && typeof source === "object"
+      ? source : { url: source, index: index + 1 };
+    const bestUrl = await resolveImageInTab(candidate.url);
+    if (bestUrl && !resolved.has(bestUrl)) {
       resolved.add(bestUrl);
-      batchResolved.push(bestUrl);
+      batchResolved.push({ url: bestUrl, index: candidate.index });
     } else {
       skipped += 1;
     }
@@ -969,7 +997,7 @@ async function resolveImagesSequential(urls, context) {
             sessionId,
             batchIndex,
             batchTotal,
-            images: resolvedBatch
+            images: resolvedBatch.map((item) => item.url)
           });
         } catch (err) {
           // ignore
@@ -990,6 +1018,23 @@ async function resolveImagesSequential(urls, context) {
         timestamp: session ? session.timestamp : ""
       });
 
+      if (session && context.autoDownload && resolvedBatch.length) {
+        // Serialized auto downloads; range selection already happened in content.js.
+        const readyBatchIndex = batchIndex;
+        autoDownloadQueue = autoDownloadQueue.then(async () => {
+          if (session.autoDownloadPaused) return;
+          const outcome = await runImageBatch(session, readyBatchIndex);
+          if (!outcome.ok) {
+            session.autoDownloadPaused = true;
+            sendProgress({
+              type: "DOWNLOAD_ERROR",
+              message: "Auto download paused. Use Resume or Save partial ZIP."
+            });
+          }
+        }).catch((error) => sendProgress({
+          type: "DOWNLOAD_ERROR", message: error.message || "Auto download interrupted"
+        }));
+      }
       batchIndex += 1;
       batchProcessed = 0;
       batchResolved = [];
@@ -1054,47 +1099,26 @@ async function downloadMedia(payload) {
     }
 
     if (images.length > 0) {
-      let imageIndex = 1;
-      for (let batchIndex = 0; batchIndex < imageBatches.length; batchIndex += 1) {
-        const batchImages = imageBatches[batchIndex];
-        const entries = [];
-        let processed = 0;
-
-        for (const url of batchImages) {
-          const ext = getExtension(url, ".jpg");
-          const entryName = `images/${imageBaseName}_${imageIndex}${ext}`;
-          imageIndex += 1;
-          processed += 1;
-          try {
-            const blob = await fetchAsBlob(url);
-            totalBytes += blob.size;
-            entries.push({ name: entryName, blob });
-          } catch (err) {
-            invalidVideos += 1;
-          }
-          sendProgress({
-            type: "DOWNLOAD_PROGRESS",
-            stage: "download",
-            current: processed,
-            total: batchImages.length,
-            batchIndex: batchIndex + 1,
-            batchTotal: totalImageBatches,
-            batchType: "images"
-          });
-          await sleep(100);
-        }
-
-        const zipName = buildImageZipName(folder, batchIndex + 1, totalImageBatches);
-        const result = await createAndDownloadZip(entries, zipName, {
-          batchIndex: batchIndex + 1,
+      await sessionsReady;
+      const sessionId = "bulk_" + Date.now() + "_" + Math.floor(Math.random() * 1000000);
+      const session = {
+        sessionId, pageTitle, imageBaseName, timestamp, batchTotal: totalImageBatches,
+        batches: new Map(imageBatches.map((batch, idx) => [idx + 1, batch])),
+        batchCandidates: new Map(),
+        downloadedBatches: new Set()
+      };
+      imageResolveSessions.set(sessionId, session);
+      saveSessions();
+      for (let index = 1; index <= totalImageBatches; index += 1) {
+        sendProgress({
+          type: "IMAGE_BATCH_READY", sessionId, batchIndex: index,
           batchTotal: totalImageBatches,
-          batchType: "images"
+          resolvedCount: session.batches.get(index).length, pageTitle
         });
-        if (result === null) {
-          return;
-        }
-        zipNames.push(zipName);
-        totalSaved += result.saved;
+        const outcome = await runImageBatch(session, index);
+        if (!outcome.ok) return; // Cached successes remain available.
+        zipNames.push(outcome.zipName);
+        totalSaved += outcome.saved;
       }
     }
 
@@ -1165,7 +1189,8 @@ async function downloadMedia(payload) {
 }
 
 
-function handleResolveImagesMessage(message, sender, sendResponse) {
+async function handleResolveImagesMessage(message, sender, sendResponse) {
+  await sessionsReady;
   if (imageResolveInProgress) {
     sendResponse({ ok: false, message: "Image resolve already running" });
     return;
@@ -1191,7 +1216,11 @@ function handleResolveImagesMessage(message, sender, sendResponse) {
 
   imageResolveInProgress = true;
   imageResolveCancel = false;
-  resolveImagesSequential(urls, { sessionId, tabId: sender && sender.tab ? sender.tab.id : null })
+  resolveImagesSequential(urls, {
+    sessionId,
+    tabId: sender && sender.tab ? sender.tab.id : null,
+    autoDownload: Boolean(message.autoDownloadImages)
+  })
     .then((result) => {
       imageResolveInProgress = false;
       const canceled = imageResolveCancel;
@@ -1205,93 +1234,26 @@ function handleResolveImagesMessage(message, sender, sendResponse) {
     });
 }
 
-function handleDownloadImageBatchMessage(message, sendResponse) {
+async function handleDownloadImageBatchMessage(message, sendResponse) {
+  await sessionsReady;
   const sessionId = String(message.sessionId || "");
   const batchIndex = Number(message.batchIndex) || 0;
   const session = imageResolveSessions.get(sessionId);
-  
-  if (!session || !batchIndex) {
+  if (!session || !session.batches.has(batchIndex)) {
     sendResponse({ ok: false, message: "Batch not ready" });
     return;
   }
-
-  const batchImages = session.batches.get(batchIndex) || [];
-  if (batchImages.length === 0) {
-    sendResponse({ ok: false, message: "Batch is empty" });
+  if (session.downloadedBatches.has(batchIndex)) {
+    sendResponse({ ok: false, message: "Already downloaded" });
     return;
   }
-  
-  const batchKey = `${sessionId}:${batchIndex}`;
-  if (activeBatchDownloads.has(batchKey)) {
-    sendResponse({ ok: false, message: "This batch is already downloading" });
+  if (activeBatchDownloads.has(sessionId + ":" + batchIndex)) {
+    sendResponse({ ok: false, message: "Batch already running" });
     return;
   }
-
-  activeBatchDownloads.add(batchKey);
+  // Return promptly to the popup; the worker checkpoints in the background.
+  runImageBatch(session, batchIndex);
   sendResponse({ ok: true });
-
-  (async () => {
-    const entries = [];
-    let processed = 0;
-    const imageBaseName = session.imageBaseName || "image";
-    const startIndex = (batchIndex - 1) * IMAGE_BATCH_SIZE + 1;
-    let imageIndex = startIndex;
-
-    for (const url of batchImages) {
-      const ext = getExtension(url, ".jpg");
-      const entryName = `images/${imageBaseName}_${imageIndex}${ext}`;
-      imageIndex += 1;
-      processed += 1;
-      try {
-        const blob = await fetchAsBlob(url);
-        entries.push({ name: entryName, blob });
-      } catch (err) {
-        // ignore failures for this batch
-      }
-      sendProgress({
-        type: "DOWNLOAD_PROGRESS",
-        stage: "download",
-        current: processed,
-        total: batchImages.length,
-        batchIndex,
-        batchTotal: session.batchTotal || 1,
-        batchType: "images"
-      });
-      await sleep(100);
-    }
-
-    const folder = `fb_media_${session.timestamp}`;
-    const zipName = buildImageZipName(folder, batchIndex, session.batchTotal || 1);
-    const result = await createAndDownloadZip(entries, zipName, {
-      batchIndex,
-      batchTotal: session.batchTotal || 1,
-      batchType: "images"
-    });
-    if (result === null) {
-      activeBatchDownloads.delete(batchKey);
-      return;
-    }
-
-    session.downloadedBatches.add(batchIndex);
-    saveSessions();
-    
-    sendProgress({
-      type: "DOWNLOAD_DONE",
-      zipName,
-      zipNames: [zipName],
-      saved: result.saved,
-      sessionId,
-      batchIndex,
-      batchTotal: session.batchTotal || 1,
-      batchType: "images"
-    });
-  })()
-    .catch(() => {
-      sendProgress({ type: "DOWNLOAD_ERROR", message: "Batch download failed" });
-    })
-    .finally(() => {
-      activeBatchDownloads.delete(batchKey);
-    });
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -1317,7 +1279,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendUnauthorizedResponse(sendResponse, device.error);
         return;
       }
-      handleResolveImagesMessage(message, sender, sendResponse);
+      handleResolveImagesMessage(message, sender, sendResponse).catch((err) => {
+        sendResponse({ ok: false, message: err.message, images: [] });
+      });
     });
     return true;
   }
@@ -1328,13 +1292,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  if (message.type === "GET_BATCH_STATUS") {
+    checkDeviceAccess().then(async (device) => {
+      if (!device.allowed) return sendUnauthorizedResponse(sendResponse, device.error);
+      try {
+        sendResponse({ ok: true, batches: await listBatchStatuses() });
+      } catch (err) {
+        sendResponse({ ok: false, message: err.message });
+      }
+    });
+    return true;
+  }
+
+  if (message.type === "SAVE_PARTIAL_BATCH") {
+    checkDeviceAccess().then(async (device) => {
+      if (!device.allowed) return sendUnauthorizedResponse(sendResponse, device.error);
+      try {
+        sendResponse(await savePartialBatch(
+          String(message.sessionId || ""), Number(message.batchIndex) || 0
+        ));
+      } catch (err) {
+        sendResponse({ ok: false, message: err.message });
+      }
+    });
+    return true;
+  }
+
   if (message.type === "DOWNLOAD_IMAGE_BATCH") {
     checkDeviceAccess().then((device) => {
       if (!device.allowed) {
         sendUnauthorizedResponse(sendResponse, device.error);
         return;
       }
-      handleDownloadImageBatchMessage(message, sendResponse);
+      handleDownloadImageBatchMessage(message, sendResponse).catch((err) => {
+        sendResponse({ ok: false, message: err.message });
+      });
     });
     return true;
   }
