@@ -28,11 +28,21 @@
           Delay (ms)
           <input type="number" id="delayMs" min="200" step="100" />
         </label>
+        <label>
+          Image From #
+          <input type="number" id="imageFrom" min="1" step="1" placeholder="1" />
+        </label>
+        <label>
+          Image To # (optional)
+          <input type="number" id="imageTo" min="1" step="1" placeholder="All" />
+        </label>
+        <p class="range-note">1-based inclusive range; blank To = all. Collects links first, then selects.</p>
       </div>
 
       <div class="toggles">
         <label><input type="checkbox" id="includeImages" /> Include images</label>
         <label><input type="checkbox" id="includeVideos" /> Include videos</label>
+        <label><input type="checkbox" id="autoDownloadImages" /> Auto-download resolved batches</label>
         <label><input type="checkbox" id="excludeThumbs" /> Exclude video thumbnails</label>
         <label><input type="checkbox" id="excludeSmall" /> Exclude tiny UI images</label>
       </div>
@@ -54,13 +64,14 @@
       </div>
 
       <div class="batch-section" id="batchSection" hidden>
-        <div class="batch-title">Resolved batches</div>
+        <div class="batch-title">Image batches and interruption recovery</div>
         <div class="batch-list" id="batchList"></div>
       </div>
 
       <p class="hint">Open a Facebook page tab before starting.</p>
     </div>
 
+    <script src="image_range.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>
