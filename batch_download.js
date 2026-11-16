@@ -52,19 +52,23 @@ async function runImageBatch(session, batchIndex) {
     for (let position = 0; position < items.length; position += 1) {
       const item = items[position];
       if (savedIndices.has(item.index)) continue;
+      let blob;
       try {
-        const blob = await fetchImageWithRetry(item.url);
+        blob = await fetchImageWithRetry(item.url);
+      } catch (err) {
+        consecutiveFailures += 1;
+      }
+      if (blob) {
         const filename = "images/" + (session.imageBaseName || "image") +
           "_" + item.index + getExtension(item.url, ".jpg");
-        await saveImageCheckpoint(key, item.index, filename, blob);
+        try {
+          await saveImageCheckpoint(key, item.index, filename, blob);
+        } catch (err) {
+          throw new Error("Recovery storage unavailable or full; free disk space and resume.");
+        }
         savedIndices.add(item.index);
         savedCount = savedIndices.size;
         consecutiveFailures = 0;
-      } catch (err) {
-        if (err && /quota|checkpoint|storage|database/i.test(String(err.message))) {
-          throw new Error("Recovery storage unavailable or full; free space and resume.");
-        }
-        consecutiveFailures += 1;
       }
       sendProgress({
         type: "IMAGE_CHECKPOINT", sessionId: session.sessionId,
@@ -98,7 +102,7 @@ async function runImageBatch(session, batchIndex) {
     }
     if (!partial) {
       session.downloadedBatches.add(batchIndex);
-      saveSessions();
+      await saveSessions();
       await removeSavedImages(key);
     }
     sendProgress({
