@@ -60,8 +60,8 @@ fb_media_YYYYMMDD_HHMMSS.zip
 Inside the ZIP:
 ```
 images/
-  image_0001.jpg
-  image_0002.jpg
+  page_name_246.jpg
+  page_name_247.jpg
 videos/
   video_0001.mp4
   video_0002.mp4
@@ -112,6 +112,16 @@ python download_media.py --input facebook_media.json --cookies cookies.txt
 - Some videos require login or are restricted.
 - Make sure the Facebook tab is active when you click "Start".
 - If ZIP creation fails, reduce the number of media items.
+
+## Development checks
+
+Node.js 18+ can run the dependency-free regression tests:
+
+```powershell
+node --test tests/image_range.test.js tests/resumable_batch.test.js
+```
+
+The tests cover inclusive range boundaries and a simulated interruption at image 230 followed by ZIP recovery. For full validation, test a real Facebook page and Chrome native messaging on your authorized Windows machine.
 
 ## Disclaimer
 This tool is for personal use only. Make sure you comply with Facebook terms of service and local laws.
