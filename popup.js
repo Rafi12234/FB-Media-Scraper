@@ -4,6 +4,9 @@ const defaultOptions = {
   delayMs: 1200,
   includeImages: true,
   includeVideos: true,
+  autoDownloadImages: true,
+  imageFrom: 1,
+  imageTo: 0,
   excludeThumbs: true,
   excludeSmall: true
 };
@@ -19,6 +22,9 @@ const fields = {
   maxScrolls: document.getElementById("maxScrolls"),
   idleLimit: document.getElementById("idleLimit"),
   delayMs: document.getElementById("delayMs"),
+  imageFrom: document.getElementById("imageFrom"),
+  imageTo: document.getElementById("imageTo"),
+  autoDownloadImages: document.getElementById("autoDownloadImages"),
   includeImages: document.getElementById("includeImages"),
   includeVideos: document.getElementById("includeVideos"),
   excludeThumbs: document.getElementById("excludeThumbs"),
@@ -47,70 +53,90 @@ function clearBatchSection() {
 }
 
 function restoreBatchButtons() {
-  chrome.storage.local.get(['imageResolveSessions'], (result) => {
-    const sessionsData = result.imageResolveSessions || {};
-    Object.keys(sessionsData).forEach((key) => {
-      const session = sessionsData[key];
-      if (session.batches && Array.isArray(session.batches)) {
-        session.batches.forEach(([batchIndex, images]) => {
-          if (images && images.length > 0) {
-            const downloadedBatches = new Set(session.downloadedBatches || []);
-            if (!downloadedBatches.has(batchIndex)) {
-              addBatchButton({
-                sessionId: session.sessionId,
-                batchIndex,
-                batchTotal: session.batchTotal,
-                resolvedCount: images.length
-              });
-            }
-          }
-        });
-      }
-    });
+  chrome.runtime.sendMessage({ type: "GET_BATCH_STATUS" }, (response) => {
+    if (chrome.runtime.lastError || !response || !Array.isArray(response.batches)) return;
+    response.batches.forEach(addBatchButton);
   });
+}
+
+function updateBatchButton(message) {
+  const entry = batchButtons.get(`${message.sessionId}:${message.batchIndex}`);
+  if (!entry) return;
+  if (Number.isFinite(message.savedCount)) entry.savedCount = message.savedCount;
+  if (message.downloaded !== undefined) entry.downloaded = Boolean(message.downloaded);
+  if (message.active !== undefined) entry.active = Boolean(message.active);
+  entry.download.textContent = entry.downloaded
+    ? "Downloaded " + entry.label
+    : entry.active ? "Downloading " + entry.label + "..."
+    : "Download / Resume " + entry.label;
+  entry.download.disabled = entry.downloaded || entry.active;
+  entry.recover.disabled = entry.savedCount === 0;
+  entry.recover.textContent = `Save partial ZIP (${entry.savedCount} images)`;
+  entry.details.textContent = `${entry.savedCount} / ${entry.total} images cached safely`;
 }
 
 function addBatchButton(message) {
   const sessionId = message.sessionId || "";
   const batchIndex = Number(message.batchIndex) || 0;
   const batchTotal = Number(message.batchTotal) || 0;
-  if (!sessionId || !batchIndex) return;
-
+  const total = Number(message.resolvedCount) || 0;
+  if (!sessionId || !batchIndex || total <= 0) return;
   const key = `${sessionId}:${batchIndex}`;
-  if (batchButtons.has(key)) return;
+  if (batchButtons.has(key)) return updateBatchButton(message);
 
-  const resolvedCount = Number(message.resolvedCount) || 0;
-  if (resolvedCount <= 0) return;
-  const label = batchTotal > 0 ? `Batch ${batchIndex}/${batchTotal}` : `Batch ${batchIndex}`;
-  const button = document.createElement("button");
-  button.className = "batch-button";
-  button.textContent = `Download ${label} (${resolvedCount} images)`;
-  button.addEventListener("click", async () => {
-    const allowed = await checkDeviceBeforeUse();
-    if (!allowed) return;
+  const label = batchTotal ? `Batch ${batchIndex}/${batchTotal}` : `Batch ${batchIndex}`;
+  const wrapper = document.createElement("div");
+  wrapper.className = "batch-entry";
+  const caption = document.createElement("div");
+  caption.className = "batch-caption";
+  caption.textContent = (message.pageTitle || "Facebook images") + " • " + label;
+  const details = document.createElement("div");
+  details.className = "batch-caption";
+  const download = document.createElement("button");
+  download.className = "batch-button";
+  const recover = document.createElement("button");
+  recover.className = "batch-button batch-recover";
 
-    button.disabled = true;
-    button.textContent = `Downloading ${label}...`;
-    chrome.runtime.sendMessage(
-      { type: "DOWNLOAD_IMAGE_BATCH", sessionId, batchIndex },
-      (response) => {
-        const err = chrome.runtime.lastError;
-        if (err || !response || !response.ok) {
-          button.disabled = false;
-          button.textContent = `Download ${label} (${resolvedCount} images)`;
-          setStatus(response && response.message ? response.message : "Batch download failed");
-        }
+  download.addEventListener("click", async () => {
+    if (!await checkDeviceBeforeUse()) return;
+    download.disabled = true;
+    chrome.runtime.sendMessage({ type: "DOWNLOAD_IMAGE_BATCH", sessionId, batchIndex }, (response) => {
+      if (chrome.runtime.lastError || !response || !response.ok) {
+        download.disabled = false;
+        setStatus(response && response.message ? response.message : "Unable to resume batch");
+      } else {
+        updateBatchButton({ sessionId, batchIndex, active: true });
       }
-    );
+    });
   });
-
-  batchButtons.set(key, button);
+  recover.addEventListener("click", async () => {
+    if (!await checkDeviceBeforeUse()) return;
+    recover.disabled = true;
+    setStatus("Packaging recovered images...");
+    chrome.runtime.sendMessage({ type: "SAVE_PARTIAL_BATCH", sessionId, batchIndex }, (response) => {
+      if (chrome.runtime.lastError || !response || !response.ok) {
+        setStatus(response && response.message ? response.message : "Recovery ZIP failed");
+      } else {
+        setStatus(`Recovered ZIP saved with ${response.saved} images`);
+      }
+      updateBatchButton({ sessionId, batchIndex });
+    });
+  });
+  wrapper.append(caption, details, download, recover);
+  batchListEl.appendChild(wrapper);
+  batchButtons.set(key, {
+    download, recover, details, label, total, savedCount: 0, downloaded: false, active: false
+  });
   showBatchSection();
-  batchListEl.appendChild(button);
+  updateBatchButton(message);
 }
 
 function readOptions() {
+  const range = ImageRange.bounds(fields.imageFrom.value, fields.imageTo.value);
   return {
+    imageFrom: range.from,
+    imageTo: range.to,
+    autoDownloadImages: fields.autoDownloadImages.checked,
     maxScrolls: Number(fields.maxScrolls.value) || defaultOptions.maxScrolls,
     idleLimit: Number(fields.idleLimit.value) || defaultOptions.idleLimit,
     delayMs: Number(fields.delayMs.value) || defaultOptions.delayMs,
@@ -125,6 +151,9 @@ function applyOptions(options) {
   fields.maxScrolls.value = options.maxScrolls;
   fields.idleLimit.value = options.idleLimit;
   fields.delayMs.value = options.delayMs;
+  fields.imageFrom.value = options.imageFrom;
+  fields.imageTo.value = options.imageTo || "";
+  fields.autoDownloadImages.checked = options.autoDownloadImages;
   fields.includeImages.checked = options.includeImages;
   fields.includeVideos.checked = options.includeVideos;
   fields.excludeThumbs.checked = options.excludeThumbs;
@@ -252,7 +281,13 @@ document.getElementById("startBtn").addEventListener("click", async () => {
   const allowed = await checkDeviceBeforeUse();
   if (!allowed) return;
 
-  const options = readOptions();
+  let options;
+  try {
+    options = readOptions();
+  } catch (err) {
+    setStatus(err.message);
+    return;
+  }
   saveOptions(options);
   try {
     const response = await sendToActiveTab({ type: "START", options });
@@ -372,16 +407,25 @@ document.getElementById("downloadMedia").addEventListener("click", async () => {
       setStatus(data.message || "Unauthorized device");
       return;
     }
-    const options = readOptions();
+    let options;
+    try {
+      options = readOptions();
+    } catch (err) {
+      setStatus(err.message);
+      return;
+    }
+    saveOptions(options);
     const timestamp = formatTimestamp(new Date());
     const images = Array.isArray(data.images) ? data.images : [];
+    const selectedImages = options.includeImages
+      ? ImageRange.select(images, options.imageFrom, options.imageTo) : [];
     const videos = Array.isArray(data.videos) ? data.videos : [];
     const payload = {
       pageUrl: data.pageUrl || "",
       pageTitle: data.pageTitle || "",
       timestamp,
       options,
-      images: options.includeImages ? images : [],
+      images: selectedImages,
       videos: options.includeVideos ? videos : []
     };
 
@@ -434,6 +478,10 @@ chrome.runtime.onMessage.addListener((message) => {
     addBatchButton(message);
   }
 
+  if (message.type === "IMAGE_CHECKPOINT") {
+    updateBatchButton(message);
+  }
+
   if (message.type === "DOWNLOAD_PROGRESS") {
     if (message.stage === "resolve") {
       setStatus(`Resolving videos ${message.current}/${message.total}`);
@@ -469,24 +517,21 @@ chrome.runtime.onMessage.addListener((message) => {
       setStatus(`Done. ${suffix}`);
     }
 
-    if (message.batchType === "images") {
-      const sessionId = message.sessionId || "";
-      const batchIndex = message.batchIndex || 0;
-      const batchTotal = message.batchTotal || 0;
-      if (sessionId && batchIndex) {
-        const key = `${sessionId}:${batchIndex}`;
-        const button = batchButtons.get(key);
-        if (button) {
-          const label = batchTotal > 0 ? `Batch ${batchIndex}/${batchTotal}` : `Batch ${batchIndex}`;
-          button.textContent = `Downloaded ${label}`;
-          button.disabled = true;
-        }
+    if (message.batchType === "images" && message.sessionId && message.batchIndex) {
+      updateBatchButton({
+        sessionId: message.sessionId, batchIndex: message.batchIndex,
+        savedCount: message.partial ? message.saved : 0,
+        downloaded: !message.partial, active: false
+      });
+      if (message.partial) {
+        setStatus(`Partial ZIP saved (${message.saved} images). Resume for missing items.`);
       }
     }
   }
 
   if (message.type === "DOWNLOAD_ERROR") {
-    setStatus(message.message || "Download failed");
+    setStatus(message.message || "Download interrupted; recovery is available.");
+    restoreBatchButtons();
   }
 });
 
