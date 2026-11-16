@@ -33,6 +33,7 @@
         "https://fb.watch/*"
       ],
       "js": [
+        "image_range.js",
         "content.js"
       ],
       "run_at": "document_idle"
